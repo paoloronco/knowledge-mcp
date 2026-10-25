@@ -2,6 +2,7 @@
 
 ![Under development](https://img.shields.io/badge/status-under%20development-orange)
 [![M8ven Score](https://m8ven.ai/badge/mcp/paoloronco/knowledge-mcp)](https://m8ven.ai/mcp/paoloronco/knowledge-mcp?s=readme)
+[![M8ven Score](https://m8ven.ai/badge/mcp/paoloronco-knowledge-mcp-14ovm2?v=28c52f88d755d516c4016cf8e421ba54)](https://m8ven.ai/mcp/paoloronco-knowledge-mcp-14ovm2?s=readme)
 
 Give your AI client access to the documents you choose. Knowledge MCP indexes your files and provides an MCP search tool that returns relevant passages, source paths, and page or slide references when available.
 
