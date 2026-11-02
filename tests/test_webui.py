@@ -220,6 +220,31 @@ class AdminBoundaryTest(unittest.TestCase):
                         server.server_close()
                 controller.close()
 
+    def test_index_completion_ignores_old_processes_and_restarts_only_for_model_changes(self):
+        with tempfile.TemporaryDirectory() as tmp, patch.object(app, 'DATA', Path(tmp)):
+            controller = app.Controller.__new__(app.Controller)
+            controller.lock = threading.RLock()
+            controller.config = {'active_embedding_model': 'e5-small', 'embedding_model': 'bge-m3', 'setup_step': 7, 'mcp_enabled': True}
+            controller.ingest_model = 'bge-m3'
+            controller.ingest_rebuild = False
+            controller.ingest_finalized = False
+            controller.stopping = False
+            controller._save = Mock()
+            controller._stop_mcp = Mock()
+            controller._start_mcp = Mock()
+            controller.ingest = Mock(wait=lambda: 0)
+            controller._finish_index(Mock(wait=lambda: 0), False, 'e5-small')
+            self.assertEqual(controller.config['active_embedding_model'], 'e5-small')
+            controller._save.assert_not_called()
+            controller._finish_index(controller.ingest, False, 'bge-m3')
+            self.assertEqual(controller.config['active_embedding_model'], 'bge-m3')
+            controller._start_mcp.assert_called_once()
+            controller._start_mcp.reset_mock()
+            controller.ingest = Mock(wait=lambda: 0)
+            controller.ingest_finalized = False
+            controller._finish_index(controller.ingest, False, 'bge-m3')
+            controller._start_mcp.assert_not_called()
+
     def test_failed_services_restart_only_while_enabled(self):
         controller = object.__new__(app.Controller)
         controller.ingest = None
@@ -369,6 +394,7 @@ class AdminBoundaryTest(unittest.TestCase):
                 self.assertEqual(controller.status()["index_progress"]["stage"], "complete")
                 controller.advance_setup(6)
                 controller.complete_onboarding()
+                controller.ingest = None
                 controller._finish_index(Mock(wait=lambda: 1), False)
                 self.assertEqual(controller.config["setup_step"], 6)
                 controller._finish_index(Mock(wait=lambda: 0), True)

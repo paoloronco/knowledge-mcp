@@ -22,11 +22,11 @@ Check curl --fail http://127.0.0.1:6333/readyz and QDRANT_URL. knowledge_status 
 
 ## Search misses newly indexed files
 
-Restart the MCP server after ingestion. Retrieval snapshots Qdrant payloads into memory on its first search.
+Current retrieval reads Qdrant directly. Check that indexing completed and that the MCP process uses the same collection and model as ingestion. After a code upgrade, restart MCP once to load the new code; subsequent indexing updates need no restart. If `index_update_required` is returned, run an incremental update to migrate the old collection.
 
 ## Empty PDF results
 
-The parser extracts embedded text only. It does not OCR scanned pages.
+The parser extracts embedded text only. It does not OCR scanned pages. Documents without extractable text are reported as indexing errors; short valid passages are retained.
 
 ## Indexing reaches 100% but reports failures
 
@@ -36,7 +36,11 @@ The percentage counts documents examined, including any that fail parsing or ind
 docker exec knowledge-mcp sh -lc 'find /data/ingestion -name errors.log -type f -print -exec tail -n 20 {} \;'
 ```
 
-Review file paths before sharing this output because it may contain private names. Microsoft Office lock files beginning with `~$` are excluded by current releases. After updating both app and host-agent containers while retaining their named volumes, run the incremental update from the dashboard; already indexed documents are not embedded again.
+Review file paths before sharing this output because it may contain private names. Microsoft Office lock files beginning with `~$` are excluded by current releases. After updating both app and host-agent containers while retaining their named volumes, run the incremental update from the dashboard. Documents are reprocessed when the index format, model or chunking settings have changed; otherwise unchanged documents are skipped.
+
+## A file changed but incremental indexing skipped it
+
+Incremental runs reuse SHA-256 checksums when file size, nanosecond timestamps and file identity agree. On filesystems or tools that preserve all of that metadata during edits, run `python ingestion/ingest.py --verify-hashes`. Manual host-agent resynchronization also clears its in-memory checksum cache. Use reliable local timestamps for automatic updates.
 
 ## SentenceTransformer import fails in torchvision
 

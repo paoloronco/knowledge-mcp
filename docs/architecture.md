@@ -1,19 +1,22 @@
 # Architecture
 
-~~~text
-Documents (read-only host mount or legacy document volume)
-    -> ingestion/ingest.py -> dense Qdrant collection
-                                |          |
-                       dense query      payload scroll
-                                |          |
-                         mcp/retrieval.py (ranking, policy, redaction)
-                                -> mcp/server.py -> MCP client
-~~~
+```text
+Selected read-only documents
+    -> host companion (optional sync with checksum cache)
+    -> ingestion (policy, parsing, redaction, token-aware chunks, bounded embedding batches)
+    -> per-model Qdrant collection: dense vectors + sparse lexical vectors + payload indexes
+    -> live filtered retrieval / document navigation
+    -> read-only MCP tools over Streamable HTTP
+```
 
-Ingestion parses supported files, hashes each file, chunks its text, embeds chunks with multilingual-e5-small and upserts them into one dense Qdrant collection. The state file records indexed SHA-256 hashes and sources. A successful complete run removes documents no longer present; --limit processes a sample and does not purge missing documents. An empty source is rejected unless `--allow-empty` is specified explicitly.
+The dashboard passes `KNOWLEDGE_ROOT` and selected relative `INDEX_SOURCE_PATHS` to ingestion and supervises Qdrant and MCP. The host companion scans selected folders periodically after onboarding and synchronizes policy-eligible files. Unchanged file checksums are reused only while size, timestamps and file identity agree; source transfers still verify their SHA-256 digest. Excluded directories are pruned during discovery, and unreadable directories abort the scan rather than appearing deleted.
 
-The dashboard stores selected folders under a shared source root. It passes the container-visible root to ingestion as `KNOWLEDGE_ROOT` and the selected relative folders in `INDEX_SOURCE_PATHS`. The host agent checks access before a folder is added and scans only selected folders when requested during onboarding; after onboarding it also refreshes periodically. Scheduled runs skip parsing and embedding documents whose hashes and source paths have not changed. The dashboard supervises bundled Qdrant and the MCP process. An externally managed Qdrant instance must be controlled outside the dashboard.
+Ingestion keeps Markdown, HTML, Word heading and PDF page/PowerPoint slide references. Word and slide tables are included. It redacts recognized credential patterns before splitting, retains short text and splits further to respect the embedding model's tokenizer limit. Byte-identical files of the same format and lifecycle are grouped with source aliases; historical and current copies remain separate. Each model retains its own collection. New dense vectors and payloads use on-disk storage.
 
-At first search, retrieval loads Qdrant payloads into process memory for lexical scoring, entity matching and context expansion. Dense candidates come from Qdrant. Reciprocal rank fusion combines both lists before metadata ranking and diversification. Restart the server after indexing; the in-memory payload copy is not refreshed automatically.
+The state checkpoint records content hashes, sources, file metadata and a pipeline signature. An append-only journal records pending and completed documents without rewriting the entire checkpoint for every file. A single-writer lock prevents competing runs with the same state. Failed documents can be retried; successful documents remain recorded. Each document is published for search after all its batches complete. A successful replacement removes older chunk layouts. A complete scan removes missing documents, while retaining the last usable version of a failed replacement. `--limit` never purges missing documents. An empty source is rejected unless `--allow-empty` is explicit.
 
-The MCP server is read-only with respect to source documents. Ingestion writes to Qdrant and its local state directory. Neither component provisions Cloudflare, mounts SMB, or enforces HTTP authentication. Those controls belong to the deployment.
+Retrieval sends dense and sparse queries to Qdrant with policy and scope filters applied before candidate limits. Grouping candidates by document prevents a large file from crowding out other sources. Reciprocal rank fusion combines the results; bounded neighbor reads enrich the strongest passages. Browse and read tools paginate indexed documents without loading the full corpus into Python memory. All output passes recursive redaction.
+
+Normal updates are visible immediately without an MCP restart. The dashboard restarts MCP when switching the active embedding model or after a rebuild; it leaves the active model unchanged after failed indexing. Rebuilds still recreate the selected collection and can leave a partial index after an error. External Qdrant instances must be managed outside the dashboard.
+
+The MCP server never modifies source documents or executes retrieved instructions. It does not provision Cloudflare, mount SMB, or enforce HTTP authentication. Those controls belong to the deployment. See [retrieval behavior](retrieval.md) and [security model](security-model.md).

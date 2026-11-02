@@ -19,7 +19,7 @@ from collections import deque
 from pathlib import Path, PurePosixPath
 
 sys.path.insert(0, str(Path(__file__).resolve().parent / "mcp"))
-from host_sync import allowed_file, host_root
+from host_sync import allowed_file, host_root, cached_file_hash
 
 
 DEFAULT_CONFIG = Path.home() / ".config" / "knowledge-mcp" / "agent.json"
@@ -86,7 +86,7 @@ def resolve_host_folder(root, host_mount=None):
     return mount.joinpath(*resolved)
 
 
-def inventory(root, policy, host_mount=None, progress=None, folders=None):
+def inventory(root, policy, host_mount=None, progress=None, folders=None, hash_cache=None):
     folder = resolve_host_folder(root, host_mount)
     if not folder.is_dir():
         raise ValueError(f"Host folder is unavailable: {root}")
@@ -99,6 +99,7 @@ def inventory(root, policy, host_mount=None, progress=None, folders=None):
     if any(part.casefold() in restricted for part in (*logical.parts, *original_parts)):
         raise ValueError("The selected host folder is excluded by the indexing policy")
     files = {}
+    hash_cache = {} if hash_cache is None else hash_cache
     checked = 0
 
     def unreadable(error):
@@ -129,17 +130,20 @@ def inventory(root, policy, host_mount=None, progress=None, folders=None):
                 try:
                     size = path.stat().st_size
                     if allowed_file(relative, size, policy):
-                        files[relative] = {"size": size, "sha256": file_hash(path)}
+                        files[relative] = {"size": size, "sha256": cached_file_hash(path, hash_cache, file_hash)}
                 except (OSError, ValueError) as error:
                     raise RuntimeError(f"Could not read {path}: {error}") from error
                 if progress:
                     progress(checked, len(files))
     if progress:
         progress(checked, len(files), force=True)
+    retained = {str(folder.joinpath(*name.split("/"))) for name in files}
+    for name in set(hash_cache) - retained:
+        del hash_cache[name]
     return folder, files
 
 
-def sync(base, token, task, host_mount=None):
+def sync(base, token, task, host_mount=None, hash_cache=None):
     last_report = 0
     last_phase = None
     checked = 0
@@ -159,7 +163,7 @@ def sync(base, token, task, host_mount=None):
         report("scanning", force=force)
 
     report("scanning")
-    folder, files = inventory(task["host_root"], task["policy"], host_mount, scanned, task.get("folders"))
+    folder, files = inventory(task["host_root"], task["policy"], host_mount, scanned, task.get("folders"), hash_cache)
     report("planning")
     body = {"revision": task["revision"], "sync_request": task["sync_request"], "files": files}
     missing = request(base, token, "/api/agent/plan", body, timeout=1800)["missing"]
@@ -240,6 +244,7 @@ def run(config_path, once=False, scan_seconds=300, host_mount=None):
     last_signature = None
     last_scan = 0
     last_probe = None
+    hash_cache = {}
     while True:
         task = None
         try:
@@ -252,12 +257,14 @@ def run(config_path, once=False, scan_seconds=300, host_mount=None):
                 check_folder(base, token, probe, host_mount)
                 last_probe = probe["id"]
             signature = (task["revision"], task["sync_request"], json.dumps(task["policy"], sort_keys=True))
+            if signature != last_signature:
+                hash_cache.clear()
             if task["source_mode"] == "host_agent" and task["host_root"] and task.get("scan_enabled", True) and not task.get("index_running") and (signature != last_signature or time.time() - last_scan >= scan_seconds):
                 done = threading.Event()
                 worker = threading.Thread(target=heartbeat, args=(base, token, done), daemon=True)
                 worker.start()
                 try:
-                    sync(base, token, task, host_mount)
+                    sync(base, token, task, host_mount, hash_cache)
                 finally:
                     done.set()
                     worker.join(timeout=1)

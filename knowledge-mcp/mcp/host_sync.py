@@ -5,6 +5,25 @@ import posixpath
 from pathlib import PurePosixPath
 
 
+def file_stamp(path):
+    info = path.stat()
+    return {"size": info.st_size, "mtime_ns": info.st_mtime_ns, "ctime_ns": info.st_ctime_ns,
+            "inode": info.st_ino, "device": info.st_dev}
+
+
+def cached_file_hash(path, cache, hasher):
+    """Reuse a checksum only while size, timestamps and file identity still agree."""
+    stamp = file_stamp(path)
+    previous = cache.get(str(path))
+    if previous and previous["stamp"] == stamp:
+        return previous["sha256"]
+    digest = hasher(path)
+    if stamp != file_stamp(path):
+        raise RuntimeError(f"Document changed while hashing: {path.name}")
+    cache[str(path)] = {"stamp": stamp, "sha256": digest}
+    return digest
+
+
 def host_root(value):
     if not isinstance(value, str) or not value or len(value) > 4096 or any(c in value for c in "\x00\r\n"):
         raise ValueError("Enter an absolute host folder path")

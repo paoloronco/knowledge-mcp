@@ -23,7 +23,7 @@ from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
 
 import yaml
-from host_sync import allowed_file, host_root, is_office_lock_file, relative_path
+from host_sync import allowed_file, host_root, is_office_lock_file, relative_path, cached_file_hash
 from embedding_models import DEFAULT_MODEL, MODELS
 from gpu_probe import GPU_MONITOR
 from policy_defaults import ensure_required_exclusions, remove_legacy_default_exclusions
@@ -218,6 +218,7 @@ class Controller:
         self.folder_probe_result = None
         self.probe_serial = 0
         self.agent_manifest = json.loads(AGENT_MANIFEST.read_text(encoding="utf-8")) if AGENT_MANIFEST.exists() else {"revision": -1, "files": {}}
+        self.sync_hash_cache = {}
         self.stopping = False
         self.restart_requested = False
         self.backup_download = None
@@ -635,7 +636,7 @@ class Controller:
                     raise ValueError("Invalid or excluded document in inventory")
             self.sync_in_progress = True
             known = self.agent_manifest.get("files", {})
-            missing = [name for name, item in files.items() if known.get(name) != item or not (HOST_SOURCE / name).is_file() or (HOST_SOURCE / name).is_symlink() or file_sha256(HOST_SOURCE / name) != item["sha256"]]
+            missing = [name for name, item in files.items() if known.get(name) != item or not (HOST_SOURCE / name).is_file() or (HOST_SOURCE / name).is_symlink() or cached_file_hash(HOST_SOURCE / name, self.sync_hash_cache, file_sha256) != item["sha256"]]
             return {"missing": missing}
 
     def agent_file(self, name, revision, size, digest, stream):
@@ -685,7 +686,7 @@ class Controller:
                 if not isinstance(item, dict) or not selected_file(name, self.config["folders"]) or not allowed_file(name, item.get("size"), policy) or not isinstance(item.get("sha256"), str):
                     raise ValueError("Invalid document inventory")
                 path = HOST_SOURCE / name
-                if not path.is_file() or path.is_symlink() or path.stat().st_size != item["size"] or file_sha256(path) != item["sha256"]:
+                if not path.is_file() or path.is_symlink() or path.stat().st_size != item["size"] or cached_file_hash(path, self.sync_hash_cache, file_sha256) != item["sha256"]:
                     raise ValueError(f"Document sync incomplete: {name}")
             for base, dirs, names in os.walk(HOST_SOURCE, topdown=False, followlinks=False):
                 folder = Path(base)
@@ -709,6 +710,9 @@ class Controller:
             tmp.write_text(json.dumps({"revision": revision, "sync_request": request_id, "files": files, "checked": checked, "synced_at": synced_at}), encoding="utf-8")
             tmp.replace(AGENT_MANIFEST)
             self.agent_manifest = {"revision": revision, "sync_request": request_id, "files": files, "checked": checked, "synced_at": synced_at}
+            retained = {str(HOST_SOURCE / name) for name in files}
+            for name in set(self.sync_hash_cache) - retained:
+                del self.sync_hash_cache[name]
             self.sync_in_progress = False
             self.agent_error_text = ""
             if request_id == self.config["sync_request"]:
@@ -909,10 +913,13 @@ class Controller:
     def _finish_index(self, process, dry_run, model_id=None):
         code = process.wait()
         with self.lock:
+            if self.ingest is not None and self.ingest is not process:
+                return
             if self.ingest is process and self.ingest_finalized:
                 return
             if self.ingest is process:
                 self.ingest_finalized = True
+            previous_model = self.config.get("active_embedding_model")
             self.last_result = {"exit_code": code, "dry_run": dry_run, "finished_at": time.time()}
             if code == 0 and not dry_run:
                 self.config["active_embedding_model"] = model_id or self.ingest_model or self.config["embedding_model"]
@@ -925,7 +932,8 @@ class Controller:
             tmp = result_file.with_suffix(".tmp")
             tmp.write_text(json.dumps(self.last_result), encoding="utf-8")
             tmp.replace(result_file)
-            if (code == 0 or self.ingest_rebuild) and not dry_run and self.config["mcp_enabled"] and not self.stopping:
+            completed_model = model_id or self.ingest_model or self.config["embedding_model"]
+            if not dry_run and self.config["mcp_enabled"] and not self.stopping and (self.ingest_rebuild or code == 0 and completed_model != previous_model):
                 self._stop_mcp()
                 self._start_mcp()
 

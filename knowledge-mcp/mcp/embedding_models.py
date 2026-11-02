@@ -35,7 +35,7 @@ MODELS = {
         "resources": "High",
         "speed": "Slow",
         "use_case": "A large multilingual model for hosts with ample memory and CPU time.",
-        "note": "This app uses dense vectors only. CPU indexing takes the most time.",
+        "note": "Uses dense semantic vectors plus the shared lexical index. CPU indexing takes the most time.",
         "url": "https://huggingface.co/BAAI/bge-m3",
     },
 }

@@ -137,15 +137,11 @@ class CoreFlowTest(unittest.TestCase):
             self.assertEqual({p.relative_to(root).as_posix() for p in paths}, {"team-a/note.md", "team-b/note.md"})
 
     def test_expansion_stays_in_section(self):
-        def point(section, chunk, text):
-            return types.SimpleNamespace(payload={
-                "document_id": "same-file", "section_index": section,
-                "chunk_index": chunk, "file_size": 20000, "text": text,
-            })
-
-        selected = point(0, 0, "relevant")
-        with patch.object(retrieval, "CORPUS", [selected, point(1, 0, "unrelated")]):
-            expanded = retrieval.expand_result_context({"payload": selected.payload})
+        selected = {"document_id": "a" * 64, "section_index": 0, "document_order": 0, "text": "relevant"}
+        chunks = [{**selected, "page": 1, "section": "Relevant"},
+                  {**selected, "section_index": 1, "document_order": 1, "text": "unrelated"}]
+        with patch.object(retrieval, "read_document", return_value={"chunks": chunks}):
+            expanded = retrieval.expand_result_context({"payload": selected})
         self.assertIn("relevant", expanded["text"])
         self.assertNotIn("unrelated", expanded["text"])
 
@@ -194,7 +190,6 @@ class CoreFlowTest(unittest.TestCase):
                 self.assertFalse(client.retrieve(ingest.COLLECTION_NAME, ids=[0]))
 
                 retrieval.client = client
-                retrieval.CORPUS = None
                 retrieval.model = FakeModel()
                 result = retrieval.search("Qdrant configuration")
                 self.assertTrue(result["results"])

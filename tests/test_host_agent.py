@@ -75,6 +75,25 @@ class DockerHostAccessTest(unittest.TestCase):
             host_agent.heartbeat("http://127.0.0.1:8080", "test-token", done)
         self.assertEqual(request.call_count, 2)
 
+    def test_inventory_reuses_only_unchanged_checksums_and_drops_deleted_paths(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            document = root / "note.md"
+            document.write_text("First telemetry settings", encoding="utf-8")
+            cache = {}
+            with patch.object(host_agent, "file_hash", wraps=host_agent.file_hash) as hashes:
+                first = host_agent.inventory(str(root), self.policy, hash_cache=cache)[1]
+                second = host_agent.inventory(str(root), self.policy, hash_cache=cache)[1]
+                self.assertEqual(first, second)
+                self.assertEqual(hashes.call_count, 1)
+                document.write_text("Changed telemetry settings", encoding="utf-8")
+                third = host_agent.inventory(str(root), self.policy, hash_cache=cache)[1]
+                self.assertNotEqual(third, first)
+                self.assertEqual(hashes.call_count, 2)
+                document.unlink()
+                host_agent.inventory(str(root), self.policy, hash_cache=cache)
+                self.assertEqual(cache, {})
+
 
 if __name__ == "__main__":
     unittest.main()

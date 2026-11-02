@@ -11,7 +11,7 @@ Embeddings and search run locally. The Docker image includes a browser dashboard
 ## Features
 
 - **Web dashboard:** select folders, choose a model, follow indexing progress, and manage services.
-- **MCP search:** combine semantic search with keyword matching and return passages with their sources.
+- **MCP search and navigation:** combine semantic and indexed lexical search, browse folders, and read documents in order with source references.
 - **Bundled Qdrant:** store document vectors without deploying a separate database container.
 - **Document formats:** PDF, Word (`.docx`), PowerPoint (`.pptx`), Markdown, plain text, and HTML.
 - **Incremental indexing:** process changed documents, remove deleted documents from the index, and schedule updates. A full rebuild is also available.
@@ -172,7 +172,7 @@ If a document fails, fix its source or use **Ignore this file**, then retry the 
 - Each model has a separate index. Search switches to a newly selected model after a successful indexing run.
 - Switching back reuses that model's index. Keeping several indexes uses more disk space.
 - The dry run checks parsing only; it does not load the embedding model.
-- BGE-M3 uses dense vectors in this app. The resource labels are relative guidance, not benchmark results.
+- BGE-M3 supplies dense semantic vectors; all models share a separate lexical index. BGE-M3's learned sparse vectors are not used. The resource labels are relative guidance, not benchmark results.
 
 ## Update without losing data
 
@@ -284,7 +284,11 @@ python ingestion/ingest.py
 python mcp/server.py
 ```
 
-The endpoint is `http://127.0.0.1:8000/mcp`. Restart the server after subsequent ingestion runs so its cached search data includes the changes.
+The endpoint is `http://127.0.0.1:8000/mcp`. Search reads the current Qdrant index directly, so subsequent ingestion updates need no MCP restart. The dashboard restarts MCP when switching the active model or after a rebuild.
+
+After upgrading from an older release, run one **incremental update** for each model index you use. It adds the lexical and navigation indexes and reprocesses documents with the new chunking rules. Source files and other model collections are preserved. A rebuild is not required. Until migrated, the search tool reports `index_update_required`.
+
+The AI client can use `browse_private_knowledge` to discover documents, `search_private_knowledge` with `path_prefix` or `source` to narrow its search, and `read_private_document` to continue reading using the returned document ID and cursor. See [retrieval behavior](docs/retrieval.md) for limits and examples.
 
 ### Code map
 
