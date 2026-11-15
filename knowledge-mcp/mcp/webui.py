@@ -1278,9 +1278,9 @@ class Handler(BaseHTTPRequestHandler):
         agent = route.startswith("/api/agent/") and route not in ("/api/agent/pair", "/api/agent/refresh")
         control_token = self.headers.get("X-Control-Token", "")
         auth_ok = (
-            _token_matches(control_token)
-            if not agent
-            else controller.agent_authenticated(control_token)
+            controller.agent_authenticated(self.headers.get("X-Agent-Token", ""))
+            if agent
+            else self._authenticated() and _token_matches(control_token)
         )
         if route != "/api/login" and not auth_ok:
             self.send(403, json.dumps({"error": "Unauthorized request"}))
@@ -1352,7 +1352,7 @@ class Handler(BaseHTTPRequestHandler):
                     return
                 self.send(200, json.dumps(result))
                 return
-            if not self._authenticated() and not _token_matches(self.headers.get("X-Control-Token", "")):
+            if not self._authenticated() or not _token_matches(self.headers.get("X-Control-Token", "")):
                 self.send(403, json.dumps({"error": "Unauthorized request"}))
                 return
             if route.path in ("/api/backup", "/api/restore"):
