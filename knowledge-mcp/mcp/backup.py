@@ -45,6 +45,20 @@ def create_backup(destination, roots, qdrant_version=None):
                 archive.add(child, arcname=f"{name}/{child.name}", filter=include)
 
 
+def _is_safe_path(candidate: Path, parent: Path) -> bool:
+    """Verify candidate resolves under parent, preventing symlink-based escape."""
+    try:
+        candidate.resolve(strict=False)
+        parent.resolve(strict=False)
+    except OSError:
+        return False
+    try:
+        candidate.resolve().is_relative_to(parent.resolve())
+    except ValueError:
+        return False
+    return True
+
+
 def stage_restore(source, roots, qdrant_version=None):
     """Validate and extract into hidden staging folders; leave live data untouched."""
     stages = {}
@@ -65,7 +79,18 @@ def stage_restore(source, roots, qdrant_version=None):
             found_roots = set()
             for count, member in enumerate(members, 2):
                 path = PurePosixPath(member.name)
-                if count > MAX_MEMBERS or path.is_absolute() or not path.parts or path.parts[0] not in roots or "\\" in member.name or ":" in member.name or any(part in ("", ".", "..") or part.startswith(".restore-") for part in member.name.split("/")) or not (member.isfile() or member.isdir()) or member.name in seen or member.size < 0 or member.isdir() and member.size != 0:
+                is_unsafe_path = path.is_absolute() or not path.parts
+                is_outside_roots = path.parts[0] not in roots
+                has_traversal = any(part in ("", ".", "..") for part in path.parts)
+                has_restore_prefix = any(part.startswith(".restore-") for part in path.parts)
+                is_duplicate = member.name in seen
+                is_bad_type = not (member.isfile() or member.isdir())
+                is_negative_size = member.size < 0
+                is_dir_with_size = member.isdir() and member.size != 0
+                has_windows_chars = "\\" in member.name or ":" in member.name
+                if (count > MAX_MEMBERS or is_unsafe_path or is_outside_roots or has_traversal
+                        or has_restore_prefix or is_duplicate or is_bad_type or is_negative_size
+                        or is_dir_with_size or has_windows_chars):
                     raise ValueError("Backup contains an unsafe path or file type")
                 seen.add(member.name)
                 if len(path.parts) == 1:
@@ -77,6 +102,8 @@ def stage_restore(source, roots, qdrant_version=None):
                 if total > MAX_UNPACKED_SIZE:
                     raise ValueError("Backup is too large to restore")
                 target = stages[path.parts[0]].joinpath(*path.parts[1:])
+                if not _is_safe_path(target, stages[path.parts[0]]):
+                    raise ValueError("Backup path escapes the staging directory")
                 if member.isdir():
                     target.mkdir(parents=True, exist_ok=True)
                 else:
