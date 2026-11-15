@@ -35,18 +35,25 @@ model = None
 _model_lock = threading.Lock()
 
 _policy_cache = None
-_policy_mtime = 0.0
+_policy_stamp = None
 _policy_lock = threading.Lock()
 
 
+def _policy_file_stamp():
+    try:
+        info = POLICY_FILE.stat()
+    except OSError:
+        return None
+    # The Web UI replaces the policy file on every save, so the inode catches
+    # edits even where st_mtime resolution is too coarse to change.
+    return (info.st_mtime_ns, info.st_size, info.st_ino)
+
+
 def load_policy():
-    global _policy_cache, _policy_mtime
+    global _policy_cache, _policy_stamp
     with _policy_lock:
-        try:
-            mtime = POLICY_FILE.stat().st_mtime
-        except OSError:
-            mtime = 0
-        if _policy_cache is not None and mtime == _policy_mtime:
+        stamp = _policy_file_stamp()
+        if _policy_cache is not None and stamp == _policy_stamp:
             return _policy_cache
         policy = (
             yaml.safe_load(POLICY_FILE.read_text(encoding="utf-8"))
@@ -55,15 +62,15 @@ def load_policy():
         )
         ensure_required_exclusions(policy)
         _policy_cache = policy
-        _policy_mtime = mtime
+        _policy_stamp = stamp
         return policy
 
 
 def invalidate_policy_cache():
-    global _policy_cache, _policy_mtime
+    global _policy_cache, _policy_stamp
     with _policy_lock:
         _policy_cache = None
-        _policy_mtime = 0.0
+        _policy_stamp = None
 
 
 def classify_source(source):
@@ -364,6 +371,16 @@ def search(
     )
     policy = load_policy()
     filters = query_filter(policy, historical, path_prefix, source)
+    if not client.collection_exists(DENSE_COLLECTION):
+        return sanitize(
+            {
+                "query": query,
+                "results": [],
+                "result_count": 0,
+                "index_update_required": True,
+                "message": "No index is available yet. Run an initial indexing job before searching.",
+            }
+        )
     info = client.get_collection(DENSE_COLLECTION)
     lexical_available = LEXICAL_VECTOR in (info.config.params.sparse_vectors or {})
     if not lexical_available:
