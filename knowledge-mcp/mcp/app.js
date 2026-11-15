@@ -1,6 +1,6 @@
 const $ = id => document.getElementById(id);
 let current = null, policy = null, wizardStep = 0, authRequired = false, folderPaths = [], eligibleFiles = [];
-let messageTimer = null, refreshError = null;
+let messageTimer = null, refreshError = null, refreshing = false;
 let modelRenderKey = '';
 const setupLabels = ['Dashboard login', 'Service health', 'Document folders', 'Indexing policy', 'Eligible documents', 'Dry-run test', 'Initial indexing'];
 const setupPaths = ['/setup/login', '/setup/health', '/setup/folders', '/setup/policy', '/setup/eligible', '/setup/dry-run', '/setup/indexing'];
@@ -507,6 +507,8 @@ function renderGpuStatus(s) {
   }
 }
 async function refresh() {
+  if (refreshing) return;
+  refreshing = true;
   try {
     const s = await api('/api/status'); current = s;
     renderEmbeddingModels(s);
@@ -516,7 +518,14 @@ async function refresh() {
     renderIndexProgress(s);
     renderIndexErrors(s);
     renderGpuStatus(s);
-    $('health').replaceChildren(badge('App', s.app_ready), badge('Qdrant', s.qdrant_ready), badge('MCP', s.mcp_running), badge('Documents', s.source_ready), ...(s.config.source_mode === 'host_agent' ? [badge('Host agent', s.agent_connected)] : []));
+    const healthBadges = [badge('App', s.app_ready), badge('Qdrant', s.qdrant_ready), badge('MCP', s.mcp_running), badge('Documents', s.source_ready), ...(s.config.source_mode === 'host_agent' ? [badge('Host agent', s.agent_connected)] : [])];
+    if (s.maintenance) {
+      const notice = document.createElement('span');
+      notice.className = 'badge';
+      notice.textContent = 'Backup or restore in progress';
+      healthBadges.push(notice);
+    }
+    $('health').replaceChildren(...healthBadges);
     $('wizard-health').replaceChildren(badge('App', s.app_ready), badge('Qdrant', s.qdrant_ready), ...(s.agent_managed ? [badge('Host agent', s.agent_connected)] : []));
     const syncState = s.agent_error ? 'Host sync failed: ' + s.agent_error : !s.agent_connected ? s.agent_managed ? 'Automatic host agent unavailable' : 'Host folder access is not configured' : s.agent_syncing ? 'Syncing documents…' : s.agent_synced ? 'Host documents synchronized' : 'Waiting for host sync';
     const syncDetail = s.agent_last_sync_at ? ` · Last sync: ${new Date(s.agent_last_sync_at * 1000).toLocaleString('en-GB')}` : '';
@@ -554,6 +563,8 @@ async function refresh() {
   } catch (e) {
     if (refreshError !== e.message) message(e.message, true);
     refreshError = e.message;
+  } finally {
+    refreshing = false;
   }
 }
 async function start() {

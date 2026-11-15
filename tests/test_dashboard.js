@@ -498,3 +498,14 @@ test('skipping initial indexing opens the dashboard and keeps indexing available
   await vm.runInContext('runIndex(false)', context);
   assert.equal(calls.some(x => x.route === '/api/index' && x.body.dry_run === false), true);
 });
+
+test('maintenance is surfaced in the health badges while polling stays responsive', async () => {
+  const {elements, context, status} = dashboard({...legacy, onboarding_complete: true, setup_step: 7});
+  status.maintenance = true;
+  await vm.runInContext('refresh()', context);
+  assert.equal(elements['health'].children.some(x => /Backup or restore/.test(x.textContent)), true);
+  status.maintenance = false;
+  await vm.runInContext('refresh()', context);
+  assert.equal(elements['health'].children.some(x => /Backup or restore/.test(x.textContent)), false);
+  assert.deepEqual(elements['health'].children.map(x => x.textContent.split(':')[0]), ['App', 'Qdrant', 'MCP', 'Documents', 'Host agent']);
+});

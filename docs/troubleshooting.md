@@ -18,7 +18,7 @@ Create knowledge-mcp/.env from .env.example and set KNOWLEDGE_ROOT to an existin
 
 ## Qdrant unavailable
 
-Check curl --fail http://127.0.0.1:6333/readyz and QDRANT_URL. knowledge_status reports unavailable when it cannot count the collection. Ingestion must create and populate the collection before the first search.
+Check curl --fail http://127.0.0.1:6333/readyz and QDRANT_URL. `knowledge_status` reports `unavailable` (with a `reason` exception class) when the backend cannot be reached, and `empty` with `index_update_required` when the collection does not exist yet. Ingestion must create and populate the collection before the first search.
 
 ## Search misses newly indexed files
 
@@ -48,7 +48,7 @@ Check that torch and torchvision in the active environment are compatible. A mis
 
 ## Remote client receives 403
 
-Check the proxy or Cloudflare Access policy. The MCP server does not issue 403 on its own. Test the endpoint with an MCP client, not a plain GET request.
+Check the proxy or Cloudflare Access policy. The MCP server does not issue 403 on its own. Test the endpoint with an MCP client, not a plain GET request. The dashboard (port 8080) does issue 403 for `Host` headers that are neither `localhost` nor an IP address; if it is served behind a reverse proxy under a hostname, list that hostname in `WEBUI_ALLOWED_HOSTS` (comma-separated). See the [security model](security-model.md).
 
 ## Service logs
 
