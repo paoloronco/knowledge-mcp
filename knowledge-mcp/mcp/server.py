@@ -9,6 +9,7 @@ load_dotenv(Path(__file__).resolve().parents[1] / ".env")
 from retrieval import (
     DENSE_COLLECTION,
     MODEL_NAME,
+    MIGRATION_MESSAGE,
     client,
     index_available,
     legacy_chunk_count,
@@ -48,6 +49,13 @@ def knowledge_status() -> dict:
         "index_version": INDEX_VERSION,
         "index_update_required": None,
         "navigation": ["browse_private_knowledge", "read_private_document"],
+        "tools": [
+            "knowledge_status",
+            "search_private_knowledge",
+            "browse_private_knowledge",
+            "read_private_document",
+        ],
+        "message": None,
         "reason": None,
     }
     try:
@@ -67,15 +75,20 @@ def knowledge_status() -> dict:
                 key="document_order", match=models.MatchValue(value=0)
             )
         )
+        update_required = (
+            legacy_chunk_count() > 0
+            or LEXICAL_VECTOR not in (info.config.params.sparse_vectors or {})
+        )
         result.update(
             indexed_chunks=client.count(DENSE_COLLECTION, exact=False).count,
             indexed_documents=client.count(
                 DENSE_COLLECTION, count_filter=filters, exact=False
             ).count,
-            index_update_required=legacy_chunk_count() > 0
-            or LEXICAL_VECTOR not in (info.config.params.sparse_vectors or {}),
+            index_update_required=update_required,
             status="ok",
         )
+        if update_required:
+            result["message"] = MIGRATION_MESSAGE
     except Exception as exc:
         result["reason"] = type(exc).__name__
         result["indexed_chunks"] = None

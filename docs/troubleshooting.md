@@ -24,6 +24,14 @@ Check curl --fail http://127.0.0.1:6333/readyz and QDRANT_URL. `knowledge_status
 
 Current retrieval reads Qdrant directly. Check that indexing completed and that the MCP process uses the same collection and model as ingestion. After a code upgrade, restart MCP once to load the new code; subsequent indexing updates need no restart. If `index_update_required` is returned, run an incremental update to migrate the old collection.
 
+## Documents are indexed but MCP returns no results
+
+`knowledge_status` reporting `status: "ok"` with `index_update_required: true` means the collection still needs the upgrade to hybrid search and navigation. Legacy chunks lack the versioned payload fields required by the retrieval filters, so browse and read return nothing for them; search keeps working with dense-only retrieval when only the lexical vector is missing. All three tools include `index_update_required: true` with an actionable `message`. Run one incremental update per embedding model from the dashboard (or `python ingestion/ingest.py` for a source install), then wait for completion. Reconnect the MCP client afterwards to refresh its cached `tools/list`; the server registers `knowledge_status`, `search_private_knowledge`, `browse_private_knowledge` and `read_private_document` unconditionally. Verify with `knowledge_status`: `index_update_required` becomes `false`.
+
+## Documents unavailable during host sync
+
+After recreating the containers, the Documents badge reads `syncing…` (or `waiting for sync`) until the companion rescans the host folders, transfers changed files, and commits the first sync. The overview and Document folders page show the phase and counts; the badge turns `ready` when the sync completes. `docker logs knowledge-mcp-host-agent` records startup, connection, scan results, transfer progress, and completion. If the badge stays `unavailable`, check that the companion is running and paired with `docker ps` and `docker logs knowledge-mcp-host-agent`.
+
 ## Empty PDF results
 
 The parser extracts embedded text only. It does not OCR scanned pages. Documents without extractable text are reported as indexing errors; short valid passages are retained.

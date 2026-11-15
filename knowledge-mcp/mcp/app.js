@@ -50,9 +50,9 @@ function message(value, error = false) {
     notice.textContent = '';
   }, error ? 7000 : 4000);
 }
-function badge(name, good) {
-  const el = document.createElement('span'); el.className = 'badge' + (good ? ' ok' : '');
-  el.textContent = name + ': ' + (good ? 'ready' : 'unavailable'); return el;
+function badge(name, good, pending) {
+  const el = document.createElement('span'); el.className = 'badge' + (good ? ' ok' : pending ? ' pending' : '');
+  el.textContent = name + ': ' + (good ? 'ready' : pending || 'unavailable'); return el;
 }
 function renderSetupProgress(status) {
   const done = Math.max(0, Math.min(7, status.config.setup_step || 0));
@@ -506,6 +506,18 @@ function renderGpuStatus(s) {
     card.replaceChildren(icon, body);
   }
 }
+function syncInProgress(s) {
+  return s.config.source_mode === 'host_agent' && !s.source_ready && !s.agent_error && s.agent_connected && (s.agent_syncing || s.scan_running || Boolean(s.agent_progress));
+}
+function syncProgressDetail(s) {
+  const progress = s.agent_progress;
+  if (!progress) return '';
+  if (progress.phase === 'scanning') return `: ${progress.checked || 0} files checked, ${progress.eligible || 0} eligible`;
+  if (progress.phase === 'transferring' && progress.total) return `: ${progress.completed || 0} of ${progress.total} documents transferred`;
+  if (progress.phase === 'planning') return ': planning transfer';
+  if (progress.phase === 'finalizing') return ': finalizing';
+  return '';
+}
 async function refresh() {
   if (refreshing) return;
   refreshing = true;
@@ -518,7 +530,10 @@ async function refresh() {
     renderIndexProgress(s);
     renderIndexErrors(s);
     renderGpuStatus(s);
-    const healthBadges = [badge('App', s.app_ready), badge('Qdrant', s.qdrant_ready), badge('MCP', s.mcp_running), badge('Documents', s.source_ready), ...(s.config.source_mode === 'host_agent' ? [badge('Host agent', s.agent_connected)] : [])];
+    const syncing = syncInProgress(s);
+    const syncDetailText = syncing ? syncProgressDetail(s) : '';
+    const documentsPending = syncing ? 'syncing…' : !s.source_ready && !s.agent_error && s.agent_connected && !s.agent_synced && s.config.source_mode === 'host_agent' ? 'waiting for sync' : null;
+    const healthBadges = [badge('App', s.app_ready), badge('Qdrant', s.qdrant_ready), badge('MCP', s.mcp_running), badge('Documents', s.source_ready, documentsPending), ...(s.config.source_mode === 'host_agent' ? [badge('Host agent', s.agent_connected)] : [])];
     if (s.maintenance) {
       const notice = document.createElement('span');
       notice.className = 'badge';
@@ -527,14 +542,15 @@ async function refresh() {
     }
     $('health').replaceChildren(...healthBadges);
     $('wizard-health').replaceChildren(badge('App', s.app_ready), badge('Qdrant', s.qdrant_ready), ...(s.agent_managed ? [badge('Host agent', s.agent_connected)] : []));
-    const syncState = s.agent_error ? 'Host sync failed: ' + s.agent_error : !s.agent_connected ? s.agent_managed ? 'Automatic host agent unavailable' : 'Host folder access is not configured' : s.agent_syncing ? 'Syncing documents…' : s.agent_synced ? 'Host documents synchronized' : 'Waiting for host sync';
+    const syncState = s.agent_error ? 'Host sync failed: ' + s.agent_error : !s.agent_connected ? s.agent_managed ? 'Automatic host agent unavailable' : 'Host folder access is not configured' : syncing ? 'Syncing documents' + (syncDetailText || '…') : s.agent_synced ? 'Host documents synchronized' : 'Waiting for host sync';
     const syncDetail = s.agent_last_sync_at ? ` · Last sync: ${new Date(s.agent_last_sync_at * 1000).toLocaleString('en-GB')}` : '';
     $('agent-status').textContent = s.config.source_mode === 'host_agent' ? syncState + syncDetail : '';
     $('index-state').textContent = s.index_running ? 'Indexing in progress…' : s.config.initial_index_skipped && (!s.last_result || s.last_result.dry_run) ? 'Initial indexing has not run yet.' : s.last_result ? `${s.last_result.dry_run ? 'Dry run' : 'Indexing'} ${s.last_result.exit_code === 0 ? 'completed' : s.index_error_count ? 'finished with document errors' : 'failed'} · ${new Date(s.last_result.finished_at * 1000).toLocaleString('en-GB')}` : 'No run recorded.';
     $('index-summary').classList.toggle('completed', !s.index_running && s.last_result?.exit_code === 0 && !(s.config.initial_index_skipped && s.last_result.dry_run));
     $('index-summary').classList.toggle('failed', !s.index_running && s.last_result && s.last_result.exit_code !== 0);
     const initialIndexFailed = s.config.setup_step < 7 && !s.index_running && s.last_result && !s.last_result.dry_run && s.last_result.exit_code !== 0;
-    $('overview-state').textContent = s.index_running ? 'Indexing is in progress.' : initialIndexFailed ? 'Initial indexing failed. Open Indexing to review the log and retry.' : s.config.initial_index_skipped ? 'Initial indexing was postponed. Your documents will be searchable after you run it.' : '';
+    const syncSummary = syncing ? `Document sync in progress${syncDetailText}. Search is available when the sync completes.` : '';
+    $('overview-state').textContent = s.index_running ? 'Indexing is in progress.' : initialIndexFailed ? 'Initial indexing failed. Open Indexing to review the log and retry.' : s.config.initial_index_skipped ? 'Initial indexing was postponed. Your documents will be searchable after you run it.' : syncSummary;
     $('overview-state').classList.toggle('hidden', !$('overview-state').textContent);
     $('overview-open-indexing').classList.toggle('hidden', !s.index_running && !s.config.initial_index_skipped && !initialIndexFailed);
     $('index-open-dashboard').classList.toggle('hidden', s.config.setup_step >= 7);

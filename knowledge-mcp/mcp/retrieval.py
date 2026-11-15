@@ -33,6 +33,10 @@ LEXICAL_LIMIT = 80
 FINAL_LIMIT = 8
 MAX_CONTEXT_CHARS = 6000
 BACKEND_MESSAGE = "Qdrant is unavailable. Check the service and retry."
+MIGRATION_MESSAGE = (
+    "This collection was created by an older release. Run an incremental update "
+    "for each embedding model to enable hybrid search and document navigation."
+)
 BACKEND_ERRORS = (qdrant_exceptions.ApiException, QdrantException, OSError)
 client = QdrantClient(url=QDRANT_URL, timeout=30)
 model = None
@@ -246,6 +250,17 @@ def legacy_chunk_count():
     ).count
 
 
+def collection_needs_update(info=None):
+    try:
+        info = info if info is not None else client.get_collection(DENSE_COLLECTION)
+        return (
+            LEXICAL_VECTOR not in (info.config.params.sparse_vectors or {})
+            or legacy_chunk_count() > 0
+        )
+    except Exception:
+        return False
+
+
 def sanitize(value):
     if isinstance(value, str):
         return redact_secrets(value)
@@ -328,15 +343,16 @@ def read_document(document_id, start_chunk=0, limit=8, include_historical=False)
         if source_allowed((point.payload or {}).get("source"), policy)
     ]
     page = visible[:limit]
-    return sanitize(
-        {
-            "document_id": document_id,
-            "chunks": [public_chunk(p, policy) for p in page],
-            "next_chunk": visible[limit]["document_order"]
-            if len(visible) > limit
-            else None,
-        }
-    )
+    result = {
+        "document_id": document_id,
+        "chunks": [public_chunk(p, policy) for p in page],
+        "next_chunk": visible[limit]["document_order"]
+        if len(visible) > limit
+        else None,
+    }
+    if not visible and collection_needs_update():
+        result.update(index_update_required=True, message=MIGRATION_MESSAGE)
+    return sanitize(result)
 
 
 def browse_documents(path_prefix="", limit=30, cursor=None, include_historical=False):
@@ -382,13 +398,14 @@ def browse_documents(path_prefix="", limit=30, cursor=None, include_historical=F
             item = public_chunk(payload, policy)
             item["text"] = item["text"][:300]
             documents.append(item)
-    return sanitize(
-        {
-            "path_prefix": path_prefix,
-            "documents": documents,
-            "next_cursor": str(offset) if offset is not None else None,
-        }
-    )
+    result = {
+        "path_prefix": path_prefix,
+        "documents": documents,
+        "next_cursor": str(offset) if offset is not None else None,
+    }
+    if not documents and collection_needs_update():
+        result.update(index_update_required=True, message=MIGRATION_MESSAGE)
+    return sanitize(result)
 
 
 def expand_result_context(item, include_historical=False):
@@ -455,17 +472,8 @@ def search(
         info = client.get_collection(DENSE_COLLECTION)
     except BACKEND_ERRORS as exc:
         return backend_failure(exc, query=query, results=[], result_count=0)
+    needs_update = collection_needs_update(info)
     lexical_available = LEXICAL_VECTOR in (info.config.params.sparse_vectors or {})
-    if not lexical_available:
-        return sanitize(
-            {
-                "query": query,
-                "results": [],
-                "result_count": 0,
-                "index_update_required": True,
-                "message": "Run incremental indexing to upgrade this collection for hybrid search and navigation.",
-            }
-        )
     global model
     with _model_lock:
         if model is None:
@@ -492,27 +500,28 @@ def search(
         key=lambda p: p.score,
         reverse=True,
     )
-    lexical_vector = sparse_vector(query, query=True)
     lexical = []
-    if lexical_vector.indices:
-        try:
-            lexical_groups = client.query_points_groups(
-                DENSE_COLLECTION,
-                group_by="document_id",
-                group_size=2,
-                query=lexical_vector,
-                using=LEXICAL_VECTOR,
-                query_filter=filters,
-                limit=LEXICAL_LIMIT // 2,
-                with_payload=True,
+    if lexical_available:
+        lexical_vector = sparse_vector(query, query=True)
+        if lexical_vector.indices:
+            try:
+                lexical_groups = client.query_points_groups(
+                    DENSE_COLLECTION,
+                    group_by="document_id",
+                    group_size=2,
+                    query=lexical_vector,
+                    using=LEXICAL_VECTOR,
+                    query_filter=filters,
+                    limit=LEXICAL_LIMIT // 2,
+                    with_payload=True,
+                )
+            except BACKEND_ERRORS as exc:
+                return backend_failure(exc, query=query, results=[], result_count=0)
+            lexical = sorted(
+                (point for group in lexical_groups.groups for point in group.hits),
+                key=lambda p: p.score,
+                reverse=True,
             )
-        except BACKEND_ERRORS as exc:
-            return backend_failure(exc, query=query, results=[], result_count=0)
-        lexical = sorted(
-            (point for group in lexical_groups.groups for point in group.hits),
-            key=lambda p: p.score,
-            reverse=True,
-        )
     fused = {}
     for channel, points in (("dense", dense), ("lexical", lexical)):
         for rank, point in enumerate(points, 1):
@@ -558,17 +567,18 @@ def search(
         selected.append(result)
         if len(selected) == limit:
             break
-    return sanitize(
-        {
-            "query": query,
-            "temporal_intent": "historical" if historical else "current",
-            "candidate_chunks": len(fused),
-            "result_count": len(selected),
-            "results": selected,
-            "retrieval_policy": {
-                "historical_sources_allowed": historical,
-                "restricted_sources_excluded": True,
-            },
-            "secret_guard": {"enabled": True, "mode": "ingestion-and-output-redaction"},
-        }
-    )
+    result = {
+        "query": query,
+        "temporal_intent": "historical" if historical else "current",
+        "candidate_chunks": len(fused),
+        "result_count": len(selected),
+        "results": selected,
+        "retrieval_policy": {
+            "historical_sources_allowed": historical,
+            "restricted_sources_excluded": True,
+        },
+        "secret_guard": {"enabled": True, "mode": "ingestion-and-output-redaction"},
+    }
+    if needs_update:
+        result.update(index_update_required=True, message=MIGRATION_MESSAGE)
+    return sanitize(result)

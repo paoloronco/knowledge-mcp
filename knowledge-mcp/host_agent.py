@@ -148,6 +148,7 @@ def sync(base, token, task, host_mount=None, hash_cache=None):
     last_phase = None
     checked = 0
     eligible = 0
+    tag = f"revision={task['revision']} request={task['sync_request']}"
 
     def report(phase, completed=0, total=0, force=False):
         nonlocal last_report, last_phase
@@ -162,21 +163,28 @@ def sync(base, token, task, host_mount=None, hash_cache=None):
         checked, eligible = count, found
         report("scanning", force=force)
 
+    LOG.info("Scan started (%s): host_root=%s selected_folders=%d", tag, task["host_root"], len(task.get("folders") or []))
     report("scanning")
     folder, files = inventory(task["host_root"], task["policy"], host_mount, scanned, task.get("folders"), hash_cache)
+    LOG.info("Scan complete (%s): %d files checked, %d eligible at %s", tag, checked, len(files), folder)
     report("planning")
     body = {"revision": task["revision"], "sync_request": task["sync_request"], "files": files}
     missing = request(base, token, "/api/agent/plan", body, timeout=1800)["missing"]
+    LOG.info("Transfer plan (%s): %d documents unchanged, %d to transfer", tag, len(files) - len(missing), len(missing))
     report("transferring", total=len(missing))
+    transfer_step = max(25, len(missing) // 10)
     for completed, name in enumerate(missing, 1):
         document = folder.joinpath(*name.split("/"))
         if document.is_symlink() or not document.resolve().is_relative_to(folder):
             raise ValueError("Document changed to a symlink during sync")
         send_file(base, token, task["revision"], name, document, files[name])
         report("transferring", completed=completed, total=len(missing), force=completed == len(missing))
+        if completed == 1 or completed % transfer_step == 0 or completed == len(missing):
+            LOG.info("Transferring documents (%s): %d of %d", tag, completed, len(missing))
     report("finalizing")
+    LOG.info("Finalizing sync (%s): %d documents", tag, len(files))
     result = request(base, token, "/api/agent/commit", body, timeout=1800)
-    LOG.info("Synced %s documents (%s transferred)", result["synced"], len(missing))
+    LOG.info("Sync complete (%s): %d documents available, %d transferred", tag, result["synced"], len(missing))
 
 
 def send_file(base, token, revision, name, document, info):
@@ -220,11 +228,17 @@ def validate_url(value):
 
 
 def heartbeat(base, token, done):
+    failed = False
     while not done.wait(15):
         try:
             request(base, token, "/api/agent/task")
-        except Exception:
-            LOG.warning("Dashboard heartbeat failed")
+            if failed:
+                LOG.info("Dashboard heartbeat recovered")
+                failed = False
+        except Exception as error:
+            if not failed:
+                LOG.warning("Dashboard heartbeat failed: %s", error)
+                failed = True
 
 
 def check_folder(base, token, probe, host_mount):
@@ -237,6 +251,7 @@ def check_folder(base, token, probe, host_mount):
         result = {"id": probe["id"], "reachable": True}
     except (OSError, ValueError) as error:
         result = {"id": probe["id"], "reachable": False, "error": str(error)}
+    LOG.info("Folder probe %s: %s", probe["path"], "reachable" if result["reachable"] else result.get("error"))
     request(base, token, "/api/agent/folder-probe", result)
 
 
@@ -245,6 +260,8 @@ def run(config_path, once=False, scan_seconds=300, host_mount=None):
     last_scan = 0
     last_probe = None
     hash_cache = {}
+    connected = False
+    LOG.info("Host agent started: config=%s host_mount=%s scan_interval=%ss", config_path, host_mount, scan_seconds)
     while True:
         task = None
         try:
@@ -252,14 +269,21 @@ def run(config_path, once=False, scan_seconds=300, host_mount=None):
             base = validate_url(config["url"])
             token = config["token"]
             task = request(base, token, "/api/agent/task")
+            if not connected:
+                LOG.info("Connected to dashboard %s: mode=%s host_root=%s selected_folders=%d revision=%s sync_request=%s", base, task.get("source_mode"), task.get("host_root"), len(task.get("folders") or []), task.get("revision"), task.get("sync_request"))
+                connected = True
             probe = task.get("folder_probe")
             if probe and probe["id"] != last_probe:
                 check_folder(base, token, probe, host_mount)
                 last_probe = probe["id"]
             signature = (task["revision"], task["sync_request"], json.dumps(task["policy"], sort_keys=True))
             if signature != last_signature:
+                if last_signature is not None:
+                    LOG.info("Dashboard configuration changed (revision=%s sync_request=%s): clearing hash cache", task["revision"], task["sync_request"])
                 hash_cache.clear()
             if task["source_mode"] == "host_agent" and task["host_root"] and task.get("scan_enabled", True) and not task.get("index_running") and (signature != last_signature or time.time() - last_scan >= scan_seconds):
+                reason = "configuration changed" if signature != last_signature else "scheduled scan"
+                LOG.info("Starting sync: %s (revision=%s sync_request=%s host_root=%s)", reason, task["revision"], task["sync_request"], task["host_root"])
                 done = threading.Event()
                 worker = threading.Thread(target=heartbeat, args=(base, token, done), daemon=True)
                 worker.start()
@@ -273,12 +297,14 @@ def run(config_path, once=False, scan_seconds=300, host_mount=None):
             if once:
                 return
         except Exception as error:
-            LOG.exception("Host sync failed; retrying")
+            connected = False
+            LOG.exception("Host agent cycle failed (%s): %s; retrying in 3s", type(error).__name__, error)
             if task and task.get("source_mode") == "host_agent":
                 try:
                     request(base, token, "/api/agent/error", {"revision": task["revision"], "sync_request": task["sync_request"], "error": str(error)})
-                except Exception:
-                    pass
+                    LOG.info("Reported sync failure to dashboard: %s", error)
+                except Exception as report_error:
+                    LOG.warning("Could not report sync failure to dashboard: %s", report_error)
             if once:
                 raise
         time.sleep(3)

@@ -75,6 +75,43 @@ class DockerHostAccessTest(unittest.TestCase):
             host_agent.heartbeat("http://127.0.0.1:8080", "test-token", done)
         self.assertEqual(request.call_count, 2)
 
+    def test_sync_logs_scan_transfer_and_completion(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            mount = Path(tmp)
+            folder = mount / "mnt" / "documents"
+            folder.mkdir(parents=True)
+            for name in ("one.md", "two.md"):
+                (folder / name).write_text(name, encoding="utf-8")
+            task = {"revision": 3, "sync_request": 1, "policy": self.policy, "source_mode": "host_agent", "host_root": "/mnt/documents", "folders": [""]}
+            answers = {"/api/agent/plan": {"missing": ["one.md", "two.md"]}, "/api/agent/commit": {"synced": 2}}
+
+            def fake_request(base, token, route, payload=None, headers=None, timeout=120):
+                return answers.get(route)
+
+            with patch.object(host_agent, "request", side_effect=fake_request), patch.object(host_agent, "send_file"):
+                with self.assertLogs(host_agent.LOG, level="INFO") as logs:
+                    host_agent.sync("http://127.0.0.1:8080", "token", task, host_mount=mount)
+            output = "\n".join(logs.output)
+            self.assertIn("Scan complete", output)
+            self.assertIn("2 eligible", output)
+            self.assertIn("2 to transfer", output)
+            self.assertIn("2 of 2", output)
+            self.assertIn("Sync complete", output)
+
+    def test_run_logs_startup_connection_and_sync_start(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config = Path(tmp) / "agent.json"
+            config.write_text('{"url":"http://127.0.0.1:8080","token":"test-token"}', encoding="utf-8")
+            task = {"revision": 1, "sync_request": 0, "policy": self.policy, "source_mode": "host_agent", "host_root": "/mnt/documents", "folders": [""], "scan_enabled": True, "index_running": False}
+            with patch.object(host_agent, "request", return_value=task), patch.object(host_agent, "sync") as sync:
+                with self.assertLogs(host_agent.LOG, level="INFO") as logs:
+                    host_agent.run(config, once=True, host_mount=Path("/host"))
+            sync.assert_called_once()
+            output = "\n".join(logs.output)
+            self.assertIn("Host agent started", output)
+            self.assertIn("Connected to dashboard", output)
+            self.assertIn("Starting sync", output)
+
     def test_inventory_reuses_only_unchanged_checksums_and_drops_deleted_paths(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

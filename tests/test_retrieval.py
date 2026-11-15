@@ -443,6 +443,109 @@ class IndexingAndNavigationTest(unittest.TestCase):
         )
         self.assertIsNone(retrieval.read_document("a" * 64)["next_chunk"])
 
+    def test_legacy_collection_reports_required_update_in_every_tool(self):
+        from index_schema import ensure_search_schema
+
+        self.client.create_collection(
+            ingest.COLLECTION_NAME,
+            models.VectorParams(size=3, distance=models.Distance.COSINE),
+        )
+        ensure_search_schema(self.client, ingest.COLLECTION_NAME)
+        identity = "c" * 64
+        self.client.upsert(
+            ingest.COLLECTION_NAME,
+            [
+                models.PointStruct(
+                    id=1,
+                    vector={"": [1.0, 0.0, 0.0]},
+                    payload={
+                        "document_id": identity,
+                        "source": "notes/old.md",
+                        "filename": "old.md",
+                        "extension": ".md",
+                        "text": "Legacy VLAN configuration",
+                        "chunk_index": 0,
+                        "section_index": 0,
+                    },
+                )
+            ],
+        )
+        for result in (
+            retrieval.search("VLAN"),
+            retrieval.browse_documents(),
+            retrieval.read_document(identity),
+        ):
+            self.assertTrue(result["index_update_required"])
+            self.assertIn("incremental update", result["message"])
+        self.assertEqual(retrieval.search("VLAN")["results"], [])
+        self.assertEqual(retrieval.browse_documents()["documents"], [])
+        self.assertEqual(retrieval.read_document(identity)["chunks"], [])
+
+    def test_missing_lexical_vector_still_returns_dense_results(self):
+        from index_schema import source_metadata
+
+        self.client.create_collection(
+            ingest.COLLECTION_NAME,
+            models.VectorParams(size=3, distance=models.Distance.COSINE),
+        )
+        self.client.create_payload_index(
+            ingest.COLLECTION_NAME,
+            "document_order",
+            models.PayloadSchemaType.INTEGER,
+            wait=True,
+        )
+        identity = "d" * 64
+        source = "notes/network.md"
+        self.client.upsert(
+            ingest.COLLECTION_NAME,
+            [
+                models.PointStruct(
+                    id=1,
+                    vector=[1.0, 0.0, 0.0],
+                    payload={
+                        **source_metadata(source),
+                        "document_id": identity,
+                        "source": source,
+                        "filename": "network.md",
+                        "extension": ".md",
+                        "section_index": 0,
+                        "chunk_index": 0,
+                        "document_order": 0,
+                        "total_chunks": 1,
+                        "ready": True,
+                        "embedding_model": ingest.MODEL_NAME,
+                        "text": "Il telescopio usa la VLAN 42.",
+                    },
+                )
+            ],
+        )
+        result = retrieval.search("VLAN")
+        self.assertTrue(result["results"])
+        self.assertTrue(result["index_update_required"])
+        self.assertEqual(result["message"], retrieval.MIGRATION_MESSAGE)
+
+    def test_partial_migration_returns_results_and_reports_update(self):
+        self.write("network.md", "Il telescopio usa la VLAN 42 sulla porta 8443.")
+        self.run_index()
+        self.client.upsert(
+            ingest.COLLECTION_NAME,
+            [
+                models.PointStruct(
+                    id=9999,
+                    vector={"": [1.0, 0.0, 0.0]},
+                    payload={
+                        "document_id": "f" * 64,
+                        "source": "legacy.md",
+                        "text": "Legacy document",
+                    },
+                )
+            ],
+        )
+        result = retrieval.search("VLAN")
+        self.assertTrue(result["results"])
+        self.assertTrue(result["index_update_required"])
+        self.assertIn("incremental update", result["message"])
+
     def test_read_document_uses_the_next_chunk_order_as_cursor(self):
         from index_schema import ensure_search_schema, source_metadata
 

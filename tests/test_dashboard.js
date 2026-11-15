@@ -499,6 +499,31 @@ test('skipping initial indexing opens the dashboard and keeps indexing available
   assert.equal(calls.some(x => x.route === '/api/index' && x.body.dry_run === false), true);
 });
 
+test('documents health reports an in-progress host sync instead of unavailable', async () => {
+  const {elements, context, status} = dashboard({...legacy, onboarding_complete: true, setup_step: 7}, true, '/dashboard');
+  const documents = () => elements['health'].children.find(x => x.textContent.startsWith('Documents'));
+  status.source_ready = false;
+  status.agent_syncing = true;
+  status.agent_progress = {phase: 'scanning', checked: 120, eligible: 35, completed: 0, total: 0};
+  await vm.runInContext('refresh()', context);
+  assert.match(documents().textContent, /syncing/);
+  assert.match(documents().className, /pending/);
+  assert.match(elements['agent-status'].textContent, /120 files checked, 35 eligible/);
+  assert.match(elements['overview-state'].textContent, /sync in progress/i);
+  status.agent_progress = {phase: 'transferring', checked: 155, eligible: 35, completed: 12, total: 35};
+  await vm.runInContext('refresh()', context);
+  assert.match(elements['agent-status'].textContent, /12 of 35 documents transferred/);
+  assert.match(elements['overview-state'].textContent, /12 of 35/);
+  status.source_ready = true;
+  status.agent_syncing = false;
+  status.agent_progress = null;
+  status.agent_synced = true;
+  await vm.runInContext('refresh()', context);
+  assert.match(documents().textContent, /ready/);
+  assert.equal(elements['overview-state'].textContent, '');
+  assert.match(elements['agent-status'].textContent, /Host documents synchronized/);
+});
+
 test('maintenance is surfaced in the health badges while polling stays responsive', async () => {
   const {elements, context, status} = dashboard({...legacy, onboarding_complete: true, setup_step: 7});
   status.maintenance = true;

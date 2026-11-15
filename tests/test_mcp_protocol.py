@@ -38,6 +38,41 @@ class KnowledgeStatusTest(unittest.TestCase):
         self.assertTrue(result["index_update_required"])
         self.assertEqual(result["indexed_chunks"], 0)
         self.assertIsNone(result["reason"])
+        self.assertEqual(
+            set(result["tools"]),
+            {
+                "knowledge_status",
+                "search_private_knowledge",
+                "browse_private_knowledge",
+                "read_private_document",
+            },
+        )
+
+    def test_legacy_collection_status_explains_the_required_update(self):
+        class LegacyCollection:
+            def collection_exists(self, name):
+                return True
+
+            def get_collection(self, name):
+                return types.SimpleNamespace(
+                    config=types.SimpleNamespace(
+                        params=types.SimpleNamespace(sparse_vectors={})
+                    )
+                )
+
+            def count(self, *args, **kwargs):
+                return types.SimpleNamespace(count=59)
+
+        client = LegacyCollection()
+        with (
+            patch.object(retrieval, "client", client),
+            patch.object(knowledge_server, "client", client),
+        ):
+            result = knowledge_server.knowledge_status()
+        self.assertEqual(result["status"], "ok")
+        self.assertTrue(result["index_update_required"])
+        self.assertIn("incremental update", result["message"])
+        self.assertIsNone(result["reason"])
 
     def test_backend_failure_exposes_the_exception_class(self):
         broken = Mock()
