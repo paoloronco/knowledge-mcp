@@ -284,6 +284,28 @@ class AdminBoundaryTest(unittest.TestCase):
                         server.server_close()
                         controller.close()
 
+    def test_malformed_auth_record_is_treated_as_a_wrong_password(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            data = Path(tmp) / "data"
+            source = data / "documents"
+            source.mkdir(parents=True)
+            auth = data / "auth.json"
+            auth.write_text("{not json", encoding="utf-8")
+            with (
+                patch.object(app, "DATA", data), patch.object(app, "SOURCE", source),
+                patch.object(app, "MANAGED_SOURCE", source), patch.object(app, "HOST_SOURCE", data / "host-documents"),
+                patch.object(app, "CONFIG", data / "config.json"), patch.object(app, "POLICY", data / "index-policy.yaml"),
+                patch.object(app, "AUTH", auth), patch.object(app, "AGENT_AUTH", data / "agent-auth.json"),
+                patch.object(app, "AGENT_MANIFEST", data / "agent-manifest.json"),
+                patch.object(app, "AUTO_AGENT_CONFIG", None),
+                patch.object(app.Controller, "_schedule", lambda self: None),
+            ):
+                controller = app.Controller()
+                try:
+                    self.assertFalse(controller.check_password("long-test-password"))
+                finally:
+                    controller.close()
+
     def test_backup_pause_releases_the_lock_while_the_archive_is_written(self):
         with tempfile.TemporaryDirectory() as tmp:
             data = Path(tmp) / "data"
