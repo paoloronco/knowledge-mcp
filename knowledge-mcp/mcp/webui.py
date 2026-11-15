@@ -28,6 +28,7 @@ from embedding_models import DEFAULT_MODEL, MODELS
 from gpu_probe import GPU_MONITOR
 from policy_defaults import ensure_required_exclusions, remove_legacy_default_exclusions
 from backup import MAX_UNPACKED_SIZE, create_backup, stage_restore, apply_restore
+from retrieval import invalidate_policy_cache
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -1467,6 +1468,7 @@ class Handler(BaseHTTPRequestHandler):
                     tmp.write_text(content, encoding="utf-8")
                     tmp.replace(POLICY)
                     controller.invalidate_result()
+                    invalidate_policy_cache()
                     if not controller.config["onboarding_complete"]:
                         controller.config["setup_step"] = min(controller.config["setup_step"], 3)
                         controller._save()

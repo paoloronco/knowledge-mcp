@@ -34,15 +34,36 @@ client = QdrantClient(url=QDRANT_URL, timeout=30)
 model = None
 _model_lock = threading.Lock()
 
+_policy_cache = None
+_policy_mtime = 0.0
+_policy_lock = threading.Lock()
+
 
 def load_policy():
-    policy = (
-        yaml.safe_load(POLICY_FILE.read_text(encoding="utf-8"))
-        if POLICY_FILE.exists()
-        else dict(DEFAULT_POLICY)
-    )
-    ensure_required_exclusions(policy)
-    return policy
+    global _policy_cache, _policy_mtime
+    with _policy_lock:
+        try:
+            mtime = POLICY_FILE.stat().st_mtime
+        except OSError:
+            mtime = 0
+        if _policy_cache is not None and mtime == _policy_mtime:
+            return _policy_cache
+        policy = (
+            yaml.safe_load(POLICY_FILE.read_text(encoding="utf-8"))
+            if POLICY_FILE.exists()
+            else dict(DEFAULT_POLICY)
+        )
+        ensure_required_exclusions(policy)
+        _policy_cache = policy
+        _policy_mtime = mtime
+        return policy
+
+
+def invalidate_policy_cache():
+    global _policy_cache, _policy_mtime
+    with _policy_lock:
+        _policy_cache = None
+        _policy_mtime = 0.0
 
 
 def classify_source(source):
