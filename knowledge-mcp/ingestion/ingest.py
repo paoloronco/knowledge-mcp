@@ -669,7 +669,11 @@ def embedding_input(record):
     )
 
 
-def fit_model_chunks(record, model):
+def fit_model_chunks(record, model, _depth=0):
+    _MAX_RECURSION = 16
+    if _depth >= _MAX_RECURSION:
+        yield record
+        return
     tokenizer = getattr(model, "tokenizer", None)
     maximum = getattr(model, "max_seq_length", None)
     if tokenizer is None or not isinstance(maximum, int):
@@ -691,7 +695,7 @@ def fit_model_chunks(record, model):
     split = split if split > 0 else middle
     for part in (text[:split], text[split:]):
         if part.strip():
-            yield from fit_model_chunks({**record, "text": part.strip()}, model)
+            yield from fit_model_chunks({**record, "text": part.strip()}, model, _depth + 1)
 
 
 def document_records(path, model=None):
