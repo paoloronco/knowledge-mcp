@@ -215,11 +215,14 @@ def log_error(path, error, stage="indexing"):
         timestamp = datetime.now(timezone.utc).isoformat()
         f.write(f"{timestamp}\t{path}\t{repr(error)}\n")
     if RUN_ERRORS_FILE is not None:
-        root = Path(os.getenv("KNOWLEDGE_ROOT", "")).resolve()
-        try:
-            source = path.resolve().relative_to(root).as_posix()
-        except ValueError:
-            source = path.name
+        if path is None:
+            source = "<index maintenance>"
+        else:
+            root = Path(os.getenv("KNOWLEDGE_ROOT", "")).resolve()
+            try:
+                source = path.resolve().relative_to(root).as_posix()
+            except ValueError:
+                source = path.name
         event = {
             "at": timestamp,
             "stage": stage,
@@ -866,31 +869,6 @@ def run_ingestion(args):
     indexed, skipped, failed, indexed_chunks = 0, 0, 0, 0
     failed_sources = set()
 
-    # Prune removed documents BEFORE indexing so a crash during cleanup
-    # leaves the index in a consistent state (old documents still present).
-    if args.limit is None and not hash_failures:
-        removed_ids = set(state["documents"]) - set(hash_to_paths)
-        for document_id in removed_ids:
-            entry = state["documents"][document_id]
-            entry_sources = {entry.get("source"), *entry.get("duplicate_sources", [])}
-            if entry_sources & failed_sources:
-                continue
-            try:
-                client.delete(
-                    COLLECTION_NAME,
-                    points_selector=Filter(
-                        must=[
-                            FieldCondition(
-                                key="document_id", match=MatchValue(value=document_id)
-                            )
-                        ]
-                    ),
-                    wait=True,
-                )
-                record_state(state, document_id, None)
-            except Exception:
-                log_error(None, RuntimeError(f"Failed to remove {document_id}"))
-
     try:
         for count, (document_id, paths) in enumerate(tqdm(documents), 1):
             write_progress("indexing", count - 1, len(documents))
@@ -1073,6 +1051,34 @@ def run_ingestion(args):
                     path.relative_to(root).as_posix() for path in paths
                 )
                 log_error(primary, exc)
+        # Prune only after indexing: a source still present on disk always has a
+        # new document_id, so removing the old version up front would discard the
+        # last usable copy when the replacement fails to parse.
+        if args.limit is None and not hash_failures:
+            for document_id in set(state["documents"]) - set(hash_to_paths):
+                entry = state["documents"][document_id]
+                entry_sources = {
+                    entry.get("source"),
+                    *entry.get("duplicate_sources", []),
+                }
+                if entry_sources & failed_sources:
+                    continue
+                try:
+                    client.delete(
+                        COLLECTION_NAME,
+                        points_selector=Filter(
+                            must=[
+                                FieldCondition(
+                                    key="document_id",
+                                    match=MatchValue(value=document_id),
+                                )
+                            ]
+                        ),
+                        wait=True,
+                    )
+                    record_state(state, document_id, None)
+                except Exception as exc:
+                    log_error(None, RuntimeError(f"Failed to remove {document_id}: {exc}"))
         state["files"] = current_files
     finally:
         save_state(state)
