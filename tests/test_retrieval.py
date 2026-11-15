@@ -385,6 +385,52 @@ class IndexingAndNavigationTest(unittest.TestCase):
         self.assertEqual(browse["documents"], [])
         self.assertEqual(read["chunks"], [])
 
+    def test_mid_request_backend_failures_are_reported(self):
+        class GetCollectionFails:
+            def collection_exists(self, name):
+                return True
+
+            def get_collection(self, name):
+                raise OSError("qdrant went away")
+
+        class QueryFails:
+            def collection_exists(self, name):
+                return True
+
+            def get_collection(self, name):
+                return types.SimpleNamespace(
+                    config=types.SimpleNamespace(
+                        params=types.SimpleNamespace(
+                            sparse_vectors={retrieval.LEXICAL_VECTOR: object()}
+                        )
+                    )
+                )
+
+            def query_points_groups(self, *args, **kwargs):
+                raise OSError("qdrant went away")
+
+        class ScrollFails:
+            def collection_exists(self, name):
+                return True
+
+            def scroll(self, *args, **kwargs):
+                raise OSError("qdrant went away")
+
+        with patch.object(retrieval, "client", GetCollectionFails()):
+            self.assertEqual(retrieval.search("telescope")["backend"], "unavailable")
+        with (
+            patch.object(retrieval, "client", QueryFails()),
+            patch.object(retrieval, "model", FakeModel()),
+        ):
+            result = retrieval.search("telescope")
+            self.assertEqual(result["backend"], "unavailable")
+            self.assertEqual(result["reason"], "OSError")
+        with patch.object(retrieval, "client", ScrollFails()):
+            self.assertEqual(retrieval.browse_documents()["backend"], "unavailable")
+            self.assertEqual(
+                retrieval.read_document("a" * 64)["backend"], "unavailable"
+            )
+
     def test_search_reports_a_missing_index_instead_of_raising(self):
         result = retrieval.search("telescope")
         self.assertTrue(result["index_update_required"])

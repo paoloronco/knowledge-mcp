@@ -7,6 +7,7 @@ from pathlib import Path, PurePosixPath
 
 import yaml
 from qdrant_client import QdrantClient, models
+from qdrant_client.http import exceptions as qdrant_exceptions
 
 from embedding_device import embedding_device
 from embedding_models import query_text
@@ -31,6 +32,7 @@ LEXICAL_LIMIT = 80
 FINAL_LIMIT = 8
 MAX_CONTEXT_CHARS = 6000
 BACKEND_MESSAGE = "Qdrant is unavailable. Check the service and retry."
+BACKEND_ERRORS = (qdrant_exceptions.ApiException, OSError)
 client = QdrantClient(url=QDRANT_URL, timeout=30)
 model = None
 _model_lock = threading.Lock()
@@ -306,14 +308,19 @@ def read_document(document_id, start_chunk=0, limit=8, include_historical=False)
             ),
         ]
     )
-    points, _ = client.scroll(
-        DENSE_COLLECTION,
-        scroll_filter=filters,
-        limit=limit + 1,
-        order_by="document_order",
-        with_payload=True,
-        with_vectors=False,
-    )
+    try:
+        points, _ = client.scroll(
+            DENSE_COLLECTION,
+            scroll_filter=filters,
+            limit=limit + 1,
+            order_by="document_order",
+            with_payload=True,
+            with_vectors=False,
+        )
+    except BACKEND_ERRORS as exc:
+        return backend_failure(
+            exc, document_id=document_id, chunks=[], next_chunk=None
+        )
     visible = [
         point.payload
         for point in points
@@ -354,14 +361,19 @@ def browse_documents(path_prefix="", limit=30, cursor=None, include_historical=F
     policy = load_policy()
     filters = query_filter(policy, include_historical, path_prefix)
     filters.must.append(condition("document_order", 0))
-    points, offset = client.scroll(
-        DENSE_COLLECTION,
-        scroll_filter=filters,
-        limit=limit,
-        offset=int(cursor) if cursor is not None else None,
-        with_payload=True,
-        with_vectors=False,
-    )
+    try:
+        points, offset = client.scroll(
+            DENSE_COLLECTION,
+            scroll_filter=filters,
+            limit=limit,
+            offset=int(cursor) if cursor is not None else None,
+            with_payload=True,
+            with_vectors=False,
+        )
+    except BACKEND_ERRORS as exc:
+        return backend_failure(
+            exc, path_prefix=path_prefix, documents=[], next_cursor=None
+        )
     documents = []
     for point in points:
         payload = point.payload or {}
@@ -438,7 +450,10 @@ def search(
                 "message": "No index is available yet. Run an initial indexing job before searching.",
             }
         )
-    info = client.get_collection(DENSE_COLLECTION)
+    try:
+        info = client.get_collection(DENSE_COLLECTION)
+    except BACKEND_ERRORS as exc:
+        return backend_failure(exc, query=query, results=[], result_count=0)
     lexical_available = LEXICAL_VECTOR in (info.config.params.sparse_vectors or {})
     if not lexical_available:
         return sanitize(
@@ -459,15 +474,18 @@ def search(
         vector = model.encode(
             [query_text(MODEL_NAME, query)], normalize_embeddings=True
         )[0].tolist()
-    dense_groups = client.query_points_groups(
-        DENSE_COLLECTION,
-        group_by="document_id",
-        group_size=2,
-        query=vector,
-        query_filter=filters,
-        limit=DENSE_LIMIT // 2,
-        with_payload=True,
-    )
+    try:
+        dense_groups = client.query_points_groups(
+            DENSE_COLLECTION,
+            group_by="document_id",
+            group_size=2,
+            query=vector,
+            query_filter=filters,
+            limit=DENSE_LIMIT // 2,
+            with_payload=True,
+        )
+    except BACKEND_ERRORS as exc:
+        return backend_failure(exc, query=query, results=[], result_count=0)
     dense = sorted(
         (point for group in dense_groups.groups for point in group.hits),
         key=lambda p: p.score,
@@ -476,16 +494,19 @@ def search(
     lexical_vector = sparse_vector(query, query=True)
     lexical = []
     if lexical_vector.indices:
-        lexical_groups = client.query_points_groups(
-            DENSE_COLLECTION,
-            group_by="document_id",
-            group_size=2,
-            query=lexical_vector,
-            using=LEXICAL_VECTOR,
-            query_filter=filters,
-            limit=LEXICAL_LIMIT // 2,
-            with_payload=True,
-        )
+        try:
+            lexical_groups = client.query_points_groups(
+                DENSE_COLLECTION,
+                group_by="document_id",
+                group_size=2,
+                query=lexical_vector,
+                using=LEXICAL_VECTOR,
+                query_filter=filters,
+                limit=LEXICAL_LIMIT // 2,
+                with_payload=True,
+            )
+        except BACKEND_ERRORS as exc:
+            return backend_failure(exc, query=query, results=[], result_count=0)
         lexical = sorted(
             (point for group in lexical_groups.groups for point in group.hits),
             key=lambda p: p.score,
