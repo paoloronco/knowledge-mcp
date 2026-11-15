@@ -306,6 +306,101 @@ class AdminBoundaryTest(unittest.TestCase):
                 finally:
                     controller.close()
 
+    def test_corrupt_agent_auth_and_non_ascii_control_token_fail_closed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            data = Path(tmp) / "data"
+            source = data / "documents"
+            source.mkdir(parents=True)
+            auth = data / "agent-auth.json"
+            auth.write_text("{not json", encoding="utf-8")
+            with (
+                patch.object(app, "DATA", data), patch.object(app, "SOURCE", source),
+                patch.object(app, "MANAGED_SOURCE", source), patch.object(app, "HOST_SOURCE", data / "host-documents"),
+                patch.object(app, "CONFIG", data / "config.json"), patch.object(app, "POLICY", data / "index-policy.yaml"),
+                patch.object(app, "AUTH", data / "auth.json"), patch.object(app, "AGENT_AUTH", auth),
+                patch.object(app, "AGENT_MANIFEST", data / "agent-manifest.json"),
+                patch.object(app, "AUTO_AGENT_CONFIG", None),
+                patch.object(app.Controller, "_schedule", lambda self: None),
+            ):
+                controller = app.Controller()
+                try:
+                    self.assertFalse(controller.agent_authenticated("some-token"))
+                    self.assertFalse(app._token_matches("nön-ascii"))
+                finally:
+                    controller.close()
+
+    def test_backup_pause_refuses_to_start_while_the_app_is_restarting(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            data = Path(tmp) / "data"
+            source = data / "documents"
+            source.mkdir(parents=True)
+            with (
+                patch.object(app, "DATA", data), patch.object(app, "SOURCE", source),
+                patch.object(app, "MANAGED_SOURCE", source), patch.object(app, "HOST_SOURCE", data / "host-documents"),
+                patch.object(app, "CONFIG", data / "config.json"), patch.object(app, "POLICY", data / "index-policy.yaml"),
+                patch.object(app, "AUTH", data / "auth.json"), patch.object(app, "AGENT_AUTH", data / "agent-auth.json"),
+                patch.object(app, "AGENT_MANIFEST", data / "agent-manifest.json"),
+                patch.object(app, "AUTO_AGENT_CONFIG", None),
+                patch.object(app.Controller, "_schedule", lambda self: None),
+            ):
+                controller = app.Controller()
+                try:
+                    controller.stopping = True
+                    with self.assertRaisesRegex(ValueError, "restarting"), controller.backup_pause():
+                        pass
+                finally:
+                    controller.close()
+
+    def test_agent_file_streams_outside_the_lock_and_rejects_maintenance(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            data = Path(tmp) / "data"
+            source = data / "documents"
+            source.mkdir(parents=True)
+            with (
+                patch.object(app, "DATA", data), patch.object(app, "SOURCE", source),
+                patch.object(app, "MANAGED_SOURCE", source), patch.object(app, "HOST_SOURCE", data / "host-documents"),
+                patch.object(app, "CONFIG", data / "config.json"), patch.object(app, "POLICY", data / "index-policy.yaml"),
+                patch.object(app, "AUTH", data / "auth.json"), patch.object(app, "AGENT_AUTH", data / "agent-auth.json"),
+                patch.object(app, "AGENT_MANIFEST", data / "agent-manifest.json"),
+                patch.object(app, "AUTO_AGENT_CONFIG", None),
+                patch.object(app.Controller, "_schedule", lambda self: None),
+            ):
+                controller = app.Controller()
+                try:
+                    controller.config.update(source_mode="host_agent", host_root="/mnt/docs")
+                    controller.sync_in_progress = True
+                    controller.maintenance = True
+                    with self.assertRaisesRegex(ValueError, "No active host sync"):
+                        controller.agent_file("notes/example.md", 0, 5, "a" * 64, None)
+                    controller.maintenance = False
+
+                    payload = b"Example document"
+                    digest = hashlib.sha256(payload).hexdigest()
+                    reading, release = threading.Event(), threading.Event()
+
+                    class Stream:
+                        def read(self, amount):
+                            reading.set()
+                            release.wait(5)
+                            return payload
+
+                    def upload():
+                        controller.agent_file("notes/example.md", 0, len(payload), digest, Stream())
+
+                    worker = threading.Thread(target=upload, daemon=True)
+                    worker.start()
+                    try:
+                        self.assertTrue(reading.wait(5))
+                        acquired = controller.lock.acquire(timeout=1)
+                        self.assertTrue(acquired)
+                        if acquired:
+                            controller.lock.release()
+                    finally:
+                        release.set()
+                        worker.join(timeout=5)
+                finally:
+                    controller.close()
+
     def test_backup_pause_releases_the_lock_while_the_archive_is_written(self):
         with tempfile.TemporaryDirectory() as tmp:
             data = Path(tmp) / "data"

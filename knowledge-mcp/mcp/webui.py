@@ -56,7 +56,12 @@ CONTROL_TOKEN = secrets.token_urlsafe(32)
 
 def _token_matches(provided: str) -> bool:
     """Constant-time token comparison to prevent timing attacks."""
-    return hmac.compare_digest(provided, CONTROL_TOKEN)
+    if not isinstance(provided, str):
+        return False
+    try:
+        return hmac.compare_digest(provided, CONTROL_TOKEN)
+    except (TypeError, ValueError):
+        return False
 SETUP_PATHS = ("/setup/login", "/setup/health", "/setup/folders", "/setup/policy", "/setup/eligible", "/setup/dry-run", "/setup/indexing")
 DASHBOARD_PATHS = ("/dashboard", "/dashboard/indexing", "/dashboard/indexing/model", "/dashboard/folders", "/dashboard/policy", "/dashboard/settings")
 
@@ -347,6 +352,8 @@ class Controller:
     @contextmanager
     def backup_pause(self):
         with self.lock:
+            if self.stopping:
+                raise ValueError("Application is restarting")
             if self.maintenance:
                 raise ValueError("Another backup or restore is in progress")
             if self.sync_in_progress or self.local_scan["running"] or self.folder_probe is not None or self.ingest and self.ingest.poll() is None:
@@ -504,8 +511,16 @@ class Controller:
     def agent_authenticated(self, token):
         if not isinstance(token, str) or not AGENT_AUTH.exists():
             return False
-        expected = json.loads(AGENT_AUTH.read_text(encoding="utf-8"))["sha256"]
-        return hmac.compare_digest(hashlib.sha256(token.encode()).hexdigest(), expected)
+        try:
+            record = json.loads(AGENT_AUTH.read_text(encoding="utf-8"))
+            expected = record["sha256"]
+            if not isinstance(expected, str):
+                return False
+            return hmac.compare_digest(
+                hashlib.sha256(token.encode()).hexdigest(), expected
+            )
+        except (OSError, ValueError, KeyError, TypeError):
+            return False
 
     def agent_task(self):
         with self.lock:
@@ -684,6 +699,8 @@ class Controller:
     def agent_file(self, name, revision, size, digest, stream):
         path = relative_path(name)
         with self.lock:
+            if self.stopping or self.maintenance:
+                raise ValueError("No active host sync")
             policy = yaml.safe_load(POLICY.read_text(encoding="utf-8"))
             if self.config["source_mode"] != "host_agent" or revision != self.config["sync_revision"] or not self.sync_in_progress:
                 raise ValueError("No active host sync")
@@ -694,22 +711,25 @@ class Controller:
             if destination.is_symlink() or any(parent.is_symlink() for parent in destination.parents if parent != HOST_SOURCE and parent.is_relative_to(HOST_SOURCE)):
                 raise ValueError("Symlink in document destination")
             temp = destination.with_name(destination.name + ".sync-" + secrets.token_hex(8))
-            actual = hashlib.sha256()
-            remaining = size
-            try:
-                with temp.open("xb") as output:
-                    while remaining:
-                        chunk = stream.read(min(1024 * 1024, remaining))
-                        if not chunk:
-                            raise ValueError("Incomplete document upload")
-                        output.write(chunk)
-                        actual.update(chunk)
-                        remaining -= len(chunk)
-                if actual.hexdigest() != digest:
-                    raise ValueError("Document checksum mismatch")
+        actual = hashlib.sha256()
+        remaining = size
+        try:
+            with temp.open("xb") as output:
+                while remaining:
+                    chunk = stream.read(min(1024 * 1024, remaining))
+                    if not chunk:
+                        raise ValueError("Incomplete document upload")
+                    output.write(chunk)
+                    actual.update(chunk)
+                    remaining -= len(chunk)
+            if actual.hexdigest() != digest:
+                raise ValueError("Document checksum mismatch")
+            with self.lock:
+                if self.stopping or self.maintenance or revision != self.config["sync_revision"] or not self.sync_in_progress:
+                    raise ValueError("Host sync changed during upload")
                 temp.replace(destination)
-            finally:
-                temp.unlink(missing_ok=True)
+        finally:
+            temp.unlink(missing_ok=True)
 
     def agent_commit(self, values):
         files = values.get("files")
