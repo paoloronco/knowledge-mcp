@@ -18,28 +18,12 @@ import urllib.request
 from collections import deque
 from pathlib import Path, PurePosixPath
 
-from cryptography.fernet import Fernet
-
 sys.path.insert(0, str(Path(__file__).resolve().parent / "mcp"))
 from host_sync import allowed_file, host_root, cached_file_hash
 
 
 DEFAULT_CONFIG = Path.home() / ".config" / "knowledge-mcp" / "agent.json"
 LOG = logging.getLogger("knowledge-host-agent")
-
-_FERNET_KEY = os.environ.get("KNOWLEDGE_AGENT_KEY")
-if not _FERNET_KEY:
-    _FERNET_KEY = Fernet.generate_key()
-    os.environ["KNOWLEDGE_AGENT_KEY"] = _FERNET_KEY
-_FERNET = Fernet(_FERNET_KEY)
-
-
-def _encrypt_token(plaintext: str) -> str:
-    return _FERNET.encrypt(plaintext.encode("utf-8")).decode("utf-8")
-
-
-def _decrypt_token(ciphertext: str) -> str:
-    return _FERNET.decrypt(ciphertext.encode("utf-8")).decode("utf-8")
 
 
 def request(base, token, route, payload=None, headers=None, timeout=120):
@@ -266,7 +250,7 @@ def run(config_path, once=False, scan_seconds=300, host_mount=None):
         try:
             config = json.loads(config_path.read_text(encoding="utf-8"))
             base = validate_url(config["url"])
-            token = _decrypt_token(config["token"])
+            token = config["token"]
             task = request(base, token, "/api/agent/task")
             probe = task.get("folder_probe")
             if probe and probe["id"] != last_probe:
@@ -307,7 +291,9 @@ def install(url, config_path):
         raise ValueError("Pairing key is required")
     request(base, token, "/api/agent/task")
     config_path.parent.mkdir(parents=True, exist_ok=True)
-    config_path.write_text(json.dumps({"url": base, "token": _encrypt_token(token)}), encoding="utf-8")
+    config_path.write_text(json.dumps({"url": base, "token": token}), encoding="utf-8")
+    if os.name == "posix":
+        config_path.chmod(0o600)
     # Keep the service independent of a downloaded archive or repository checkout.
     runtime = config_path.resolve().parent / "runtime"
     (runtime / "mcp").mkdir(parents=True, exist_ok=True)
@@ -316,7 +302,6 @@ def install(url, config_path):
             shutil.copyfile(source, destination)
     agent_script = runtime / "host_agent.py"
     if os.name == "posix":
-        config_path.chmod(0o600)
         unit = Path.home() / ".config" / "systemd" / "user" / "knowledge-mcp-agent.service"
         unit.parent.mkdir(parents=True, exist_ok=True)
         unit.write_text("[Unit]\nDescription=Knowledge MCP host document agent\nAfter=network-online.target\n\n[Service]\nExecStart=\"" + sys.executable + "\" \"" + str(agent_script) + "\" run --config \"" + str(config_path.resolve()) + "\"\nRestart=always\nRestartSec=10\n\n[Install]\nWantedBy=default.target\n", encoding="utf-8")
