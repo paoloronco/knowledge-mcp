@@ -44,7 +44,12 @@ POLICY = DATA / "index-policy.yaml"
 DEFAULT_POLICY = ROOT / "mcp" / "index-policy.yaml"
 HTML = Path(__file__).with_name("webui.html")
 SCRIPT = Path(__file__).with_name("app.js")
-TOKEN = secrets.token_urlsafe(32)
+CONTROL_TOKEN = secrets.token_urlsafe(32)
+
+
+def _token_matches(provided: str) -> bool:
+    """Constant-time token comparison to prevent timing attacks."""
+    return hmac.compare_digest(provided, CONTROL_TOKEN)
 SETUP_PATHS = ("/setup/login", "/setup/health", "/setup/folders", "/setup/policy", "/setup/eligible", "/setup/dry-run", "/setup/indexing")
 DASHBOARD_PATHS = ("/dashboard", "/dashboard/indexing", "/dashboard/indexing/model", "/dashboard/folders", "/dashboard/policy", "/dashboard/settings")
 
@@ -1207,7 +1212,7 @@ class Handler(BaseHTTPRequestHandler):
             self.send(200 if status["app_ready"] and status["qdrant_ready"] else 503, json.dumps({"app_ready": status["app_ready"], "qdrant_ready": status["qdrant_ready"], "mcp_running": status["mcp_running"]}))
             return
         if self.path == "/" or self.path in SETUP_PATHS or self.path in DASHBOARD_PATHS:
-            token = TOKEN if self._authenticated() else ""
+            token = CONTROL_TOKEN if self._authenticated() else ""
             self.send(200, HTML.read_text(encoding="utf-8").replace("__TOKEN__", token), "text/html; charset=utf-8")
             return
         if not self._authenticated():
@@ -1270,7 +1275,13 @@ class Handler(BaseHTTPRequestHandler):
             return
         route = urlsplit(self.path).path
         agent = route.startswith("/api/agent/") and route not in ("/api/agent/pair", "/api/agent/refresh")
-        if route != "/api/login" and (not controller.agent_authenticated(self.headers.get("X-Agent-Token")) if agent else not self._authenticated() or self.headers.get("X-Control-Token") != TOKEN):
+        control_token = self.headers.get("X-Control-Token", "")
+        auth_ok = (
+            _token_matches(control_token)
+            if not agent
+            else controller.agent_authenticated(control_token)
+        )
+        if route != "/api/login" and not auth_ok:
             self.send(403, json.dumps({"error": "Unauthorized request"}))
             return
         self.connection.settimeout(30)
@@ -1340,7 +1351,7 @@ class Handler(BaseHTTPRequestHandler):
                     return
                 self.send(200, json.dumps(result))
                 return
-            if not self._authenticated() or self.headers.get("X-Control-Token") != TOKEN:
+            if not self._authenticated() and not _token_matches(self.headers.get("X-Control-Token", "")):
                 self.send(403, json.dumps({"error": "Unauthorized request"}))
                 return
             if route.path in ("/api/backup", "/api/restore"):
