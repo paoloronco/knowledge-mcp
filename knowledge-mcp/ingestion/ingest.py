@@ -575,8 +575,8 @@ def chunk_text(text):
         return [text] if text.strip() else []
 
     chunks = []
-
     start = 0
+    min_advance = max(1, CHUNK_SIZE - CHUNK_OVERLAP)
 
     while start < len(text):
         end = min(start + CHUNK_SIZE, len(text))
@@ -612,6 +612,10 @@ def chunk_text(text):
         # Safety against pathological loops
         if next_start <= start:
             next_start = end
+
+        # Prevent infinite loop on pathological input
+        if next_start - start < min_advance and end < len(text):
+            next_start = start + min_advance
 
         start = next_start
 
