@@ -19,3 +19,6 @@ beautifulsoup4>=4.12.0
 ## Text Processing
 tqdm>=4.66.0
 PyYAML>=6.0.1
+
+## Security
+cryptography>=42.0.0
