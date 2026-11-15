@@ -369,6 +369,12 @@ class IndexingAndNavigationTest(unittest.TestCase):
             {"large.md", "small.md"},
         )
 
+    def test_search_reports_a_missing_index_instead_of_raising(self):
+        result = retrieval.search("telescope")
+        self.assertTrue(result["index_update_required"])
+        self.assertEqual(result["results"], [])
+        self.assertEqual(result["result_count"], 0)
+
     def test_deleted_documents_are_pruned_even_if_another_replacement_fails(self):
         removed = self.write("removed.md", "A document that will be removed.")
         broken = self.write("broken.md", "Last usable telescope configuration.")

@@ -136,6 +136,36 @@ class CoreFlowTest(unittest.TestCase):
                 paths = ingest.discover_documents(policy)
             self.assertEqual({p.relative_to(root).as_posix() for p in paths}, {"team-a/note.md", "team-b/note.md"})
 
+    def test_chunk_text_keeps_every_character_after_an_early_natural_break(self):
+        markers = "".join(f"<{i:05d}>" for i in range(600))
+        text = markers[:905] + ". " + markers[905:]
+        chunks = ingest.chunk_text(text)
+        self.assertGreater(len(chunks), 1)
+        spans = []
+        for chunk in chunks:
+            start = text.find(chunk)
+            self.assertNotEqual(start, -1)
+            spans.append((start, start + len(chunk)))
+        covered = 0
+        for start, end in sorted(spans):
+            self.assertLessEqual(start, covered)
+            covered = max(covered, end)
+        self.assertEqual(covered, len(text))
+
+    def test_log_error_records_maintenance_failures_without_a_path(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            run_errors = base / "run-errors.jsonl"
+            with (
+                patch.object(ingest, "RUN_ERRORS_FILE", run_errors),
+                patch.object(ingest, "ERROR_LOG", base / "errors.log"),
+                patch.dict(os.environ, {"KNOWLEDGE_ROOT": str(base)}),
+            ):
+                ingest.log_error(None, RuntimeError("prune failed"), "cleanup")
+            event = json.loads(run_errors.read_text(encoding="utf-8"))
+            self.assertEqual(event["source"], "<index maintenance>")
+            self.assertEqual(event["stage"], "cleanup")
+
     def test_expansion_stays_in_section(self):
         selected = {"document_id": "a" * 64, "section_index": 0, "document_order": 0, "text": "relevant"}
         chunks = [{**selected, "page": 1, "section": "Relevant"},

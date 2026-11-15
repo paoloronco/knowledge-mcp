@@ -220,6 +220,65 @@ class AdminBoundaryTest(unittest.TestCase):
                         server.server_close()
                 controller.close()
 
+    def test_agent_header_session_cookie_and_host_allowlist_regressions(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            data = Path(tmp) / "data"
+            source = data / "documents"
+            source.mkdir(parents=True)
+            with (
+                patch.object(app, "DATA", data), patch.object(app, "SOURCE", source),
+                patch.object(app, "MANAGED_SOURCE", source), patch.object(app, "HOST_SOURCE", data / "host-documents"),
+                patch.object(app, "CONFIG", data / "config.json"), patch.object(app, "POLICY", data / "index-policy.yaml"),
+                patch.object(app, "AUTH", data / "auth.json"), patch.object(app, "AGENT_AUTH", data / "agent-auth.json"),
+                patch.object(app, "AGENT_MANIFEST", data / "agent-manifest.json"),
+                patch.object(app, "AUTO_AGENT_CONFIG", None),
+                patch.object(app.Controller, "_schedule", lambda self: None),
+            ):
+                controller = app.Controller()
+                with patch.object(app, "controller", controller):
+                    server = ThreadingHTTPServer(("127.0.0.1", 0), app.Handler)
+                    thread = threading.Thread(target=server.serve_forever, daemon=True)
+                    thread.start()
+                    try:
+                        url = f"http://127.0.0.1:{server.server_port}"
+                        token = controller.agent_pair()["token"]
+                        controller.config.update(source_mode="host_agent", host_root="/mnt/docs")
+                        progress = json.dumps({"revision": 0, "sync_request": 0, "phase": "scanning", "checked": 0, "eligible": 0, "completed": 0, "total": 0}).encode()
+
+                        def post(path, body, headers):
+                            request = urllib.request.Request(url + path, data=body, headers={"Content-Type": "application/json", **headers})
+                            try:
+                                with urllib.request.urlopen(request, timeout=5) as response:
+                                    return response.status
+                            except urllib.error.HTTPError as error:
+                                return error.code
+
+                        self.assertEqual(post("/api/agent/progress", progress, {"X-Agent-Token": token}), 200)
+                        self.assertEqual(post("/api/agent/progress", progress, {"X-Control-Token": token}), 403)
+                        self.assertEqual(post("/api/config?cachebust=1", json.dumps({"interval_hours": 0}).encode(), {"X-Control-Token": app.CONTROL_TOKEN}), 200)
+
+                        blocked = urllib.request.Request(url, headers={"Host": "untrusted.example:8080"})
+                        with self.assertRaises(urllib.error.HTTPError) as denied:
+                            urllib.request.urlopen(blocked)
+                        self.assertEqual(denied.exception.code, 403)
+                        with patch.dict(app.os.environ, {"WEBUI_ALLOWED_HOSTS": "knowledge.example.com"}):
+                            allowed = urllib.request.Request(url, headers={"Host": "knowledge.example.com:8080"})
+                            with urllib.request.urlopen(allowed, timeout=5) as response:
+                                self.assertEqual(response.status, 200)
+
+                        controller.set_password("long-test-password")
+                        change = json.dumps({"model": "e5-small"}).encode()
+                        self.assertEqual(post("/api/embedding-model", change, {"X-Control-Token": app.CONTROL_TOKEN}), 403)
+                        login = urllib.request.Request(url + "/api/login", data=json.dumps({"password": "long-test-password"}).encode(), headers={"Content-Type": "application/json"})
+                        with urllib.request.urlopen(login) as response:
+                            self.assertNotIn("Secure", response.headers["Set-Cookie"])
+                            cookie = response.headers["Set-Cookie"].split(";", 1)[0]
+                        self.assertEqual(post("/api/embedding-model", change, {"X-Control-Token": app.CONTROL_TOKEN, "Cookie": cookie}), 200)
+                    finally:
+                        server.shutdown()
+                        server.server_close()
+                        controller.close()
+
     def test_index_completion_ignores_old_processes_and_restarts_only_for_model_changes(self):
         with tempfile.TemporaryDirectory() as tmp, patch.object(app, 'DATA', Path(tmp)):
             controller = app.Controller.__new__(app.Controller)
