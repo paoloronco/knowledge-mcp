@@ -1319,7 +1319,7 @@ class Handler(BaseHTTPRequestHandler):
                 with controller.lock:
                     controller.sessions[session] = time.time() + 86400
                     controller.login_attempts.pop(address, None)
-                self.send(200, json.dumps({"ok": True}), cookie=f"knowledge_session={session}; HttpOnly; Secure; SameSite=Strict; Path=/; Max-Age=86400")
+                self.send(200, json.dumps({"ok": True}), cookie=f"knowledge_session={session}; HttpOnly; SameSite=Strict; Path=/; Max-Age=86400")
                 return
             if route.path.startswith("/api/agent/") and route.path not in ("/api/agent/pair", "/api/agent/refresh"):
                 if not controller.agent_authenticated(self.headers.get("X-Agent-Token")):
@@ -1408,7 +1408,7 @@ class Handler(BaseHTTPRequestHandler):
                 session = next((part.split("=", 1)[1] for part in cookie.split("; ") if part.startswith("knowledge_session=")), "")
                 with controller.lock:
                     controller.sessions.pop(session, None)
-                self.send(200, json.dumps({"ok": True}), cookie="knowledge_session=; HttpOnly; Secure; SameSite=Strict; Path=/; Max-Age=0")
+                self.send(200, json.dumps({"ok": True}), cookie="knowledge_session=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0")
                 return
             if route.path == "/api/upload":
                 self.send(404, json.dumps({"error": "Document uploads are unavailable"}))
