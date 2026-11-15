@@ -300,7 +300,10 @@ def is_candidate(path, root, policy):
     # File size; unreadable files must abort discovery rather than look deleted.
     max_size = policy.get("max_file_size_mb", 50) * 1024 * 1024
 
-    size = path.stat().st_size
+    try:
+        size = path.stat().st_size
+    except OSError as exc:
+        raise OSError(f"Document scan incomplete: {path}") from exc
 
     if size == 0 or size > max_size:
         return False

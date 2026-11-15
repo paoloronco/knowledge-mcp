@@ -16,6 +16,7 @@ import tarfile
 import tempfile
 import threading
 import time
+import traceback
 import urllib.request
 from contextlib import contextmanager
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -566,8 +567,14 @@ class Controller:
                         document = current / name
                         checked += 1
                         if not document.is_symlink():
+                            try:
+                                size = document.stat().st_size
+                            except OSError as error:
+                                raise RuntimeError(
+                                    f"Document changed during scan: {name}"
+                                ) from error
                             relative = document.relative_to(root).as_posix()
-                            if allowed_file(relative, document.stat().st_size, policy):
+                            if allowed_file(relative, size, policy):
                                 files.append(relative)
                         if time.monotonic() - last_report >= 0.25:
                             with self.lock:
@@ -1131,17 +1138,23 @@ controller = None
 
 
 class Handler(BaseHTTPRequestHandler):
+    def _session_from_cookie(self):
+        for part in self.headers.get("Cookie", "").split(";"):
+            name, _, value = part.strip().partition("=")
+            if name == "knowledge_session":
+                return value
+        return ""
+
     def _authenticated(self):
         if not controller.password_enabled():
             return True
-        cookie = self.headers.get("Cookie", "")
-        session = next((part.split("=", 1)[1] for part in cookie.split("; ") if part.startswith("knowledge_session=")), "")
+        session = self._session_from_cookie()
         with controller.lock:
-            expiry = controller.sessions.get(session, 0)
-            if expiry > time.time():
-                return True
-            controller.sessions.pop(session, None)
-        return False
+            now = time.time()
+            for key, expiry in list(controller.sessions.items()):
+                if expiry <= now:
+                    del controller.sessions[key]
+            return controller.sessions.get(session, 0) > now
 
     def _allowed_host(self):
         try:
@@ -1315,7 +1328,13 @@ class Handler(BaseHTTPRequestHandler):
                 values = json.loads(self.rfile.read(length))
                 address = self.client_address[0]
                 with controller.lock:
-                    attempts = [t for t in controller.login_attempts.get(address, []) if time.time() - t < 60]
+                    for source, stamps in list(controller.login_attempts.items()):
+                        recent = [stamp for stamp in stamps if time.time() - stamp < 60]
+                        if recent:
+                            controller.login_attempts[source] = recent
+                        else:
+                            del controller.login_attempts[source]
+                    attempts = controller.login_attempts.get(address, [])
                     if len(attempts) >= 5:
                         self.send(429, json.dumps({"error": "Try again in a minute"}))
                         return
@@ -1413,8 +1432,7 @@ class Handler(BaseHTTPRequestHandler):
                             threading.Thread(target=self.server.shutdown, daemon=True).start()
                 return
             if route.path == "/api/logout":
-                cookie = self.headers.get("Cookie", "")
-                session = next((part.split("=", 1)[1] for part in cookie.split("; ") if part.startswith("knowledge_session=")), "")
+                session = self._session_from_cookie()
                 with controller.lock:
                     controller.sessions.pop(session, None)
                 self.send(200, json.dumps({"ok": True}), cookie="knowledge_session=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0")
@@ -1494,8 +1512,8 @@ class Handler(BaseHTTPRequestHandler):
         except (ValueError, yaml.YAMLError, tarfile.TarError, EOFError) as exc:
             self.send(400, json.dumps({"error": str(exc)}))
         except Exception:
+            traceback.print_exc(file=sys.stderr)
             self.send(500, json.dumps({"error": "Internal error; check the container logs"}))
-            raise
 
 
 def main():
