@@ -398,6 +398,31 @@ class AdminBoundaryTest(unittest.TestCase):
                     finally:
                         release.set()
                         worker.join(timeout=5)
+                    self.assertEqual(controller.active_uploads, 0)
+                finally:
+                    controller.close()
+
+    def test_agent_commit_refuses_to_run_during_an_in_flight_upload(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            data = Path(tmp) / "data"
+            source = data / "documents"
+            source.mkdir(parents=True)
+            with (
+                patch.object(app, "DATA", data), patch.object(app, "SOURCE", source),
+                patch.object(app, "MANAGED_SOURCE", source), patch.object(app, "HOST_SOURCE", data / "host-documents"),
+                patch.object(app, "CONFIG", data / "config.json"), patch.object(app, "POLICY", data / "index-policy.yaml"),
+                patch.object(app, "AUTH", data / "auth.json"), patch.object(app, "AGENT_AUTH", data / "agent-auth.json"),
+                patch.object(app, "AGENT_MANIFEST", data / "agent-manifest.json"),
+                patch.object(app, "AUTO_AGENT_CONFIG", None),
+                patch.object(app.Controller, "_schedule", lambda self: None),
+            ):
+                controller = app.Controller()
+                try:
+                    controller.config.update(source_mode="host_agent", host_root="/mnt/docs")
+                    controller.sync_in_progress = True
+                    controller.active_uploads = 1
+                    with self.assertRaisesRegex(ValueError, "uploads to finish"):
+                        controller.agent_commit({"files": {}, "revision": 0, "sync_request": 0})
                 finally:
                     controller.close()
 

@@ -7,6 +7,7 @@ from pathlib import Path, PurePosixPath
 
 import yaml
 from qdrant_client import QdrantClient, models
+from qdrant_client.common.client_exceptions import QdrantException
 from qdrant_client.http import exceptions as qdrant_exceptions
 
 from embedding_device import embedding_device
@@ -32,7 +33,7 @@ LEXICAL_LIMIT = 80
 FINAL_LIMIT = 8
 MAX_CONTEXT_CHARS = 6000
 BACKEND_MESSAGE = "Qdrant is unavailable. Check the service and retry."
-BACKEND_ERRORS = (qdrant_exceptions.ApiException, OSError)
+BACKEND_ERRORS = (qdrant_exceptions.ApiException, QdrantException, OSError)
 client = QdrantClient(url=QDRANT_URL, timeout=30)
 model = None
 _model_lock = threading.Lock()

@@ -238,6 +238,7 @@ class Controller:
         self.stopping = False
         self.restart_requested = False
         self.maintenance = False
+        self.active_uploads = 0
         self.backup_download = None
         self.qdrant = None
         self.mcp = None
@@ -711,6 +712,7 @@ class Controller:
             if destination.is_symlink() or any(parent.is_symlink() for parent in destination.parents if parent != HOST_SOURCE and parent.is_relative_to(HOST_SOURCE)):
                 raise ValueError("Symlink in document destination")
             temp = destination.with_name(destination.name + ".sync-" + secrets.token_hex(8))
+            self.active_uploads += 1
         actual = hashlib.sha256()
         remaining = size
         try:
@@ -725,10 +727,21 @@ class Controller:
             if actual.hexdigest() != digest:
                 raise ValueError("Document checksum mismatch")
             with self.lock:
-                if self.stopping or self.maintenance or revision != self.config["sync_revision"] or not self.sync_in_progress:
+                policy = yaml.safe_load(POLICY.read_text(encoding="utf-8"))
+                if (
+                    self.stopping
+                    or self.maintenance
+                    or self.config["source_mode"] != "host_agent"
+                    or revision != self.config["sync_revision"]
+                    or not self.sync_in_progress
+                    or not selected_file(name, self.config["folders"])
+                    or not allowed_file(name, size, policy)
+                ):
                     raise ValueError("Host sync changed during upload")
                 temp.replace(destination)
         finally:
+            with self.lock:
+                self.active_uploads -= 1
             temp.unlink(missing_ok=True)
 
     def agent_commit(self, values):
@@ -739,6 +752,8 @@ class Controller:
             raise ValueError("Invalid document inventory")
         files = {name: item for name, item in files.items() if not is_office_lock_file(relative_path(name).name)}
         with self.lock:
+            if self.active_uploads:
+                raise ValueError("Wait for document uploads to finish")
             if not self.sync_in_progress or revision != self.config["sync_revision"] or self.config["source_mode"] != "host_agent":
                 raise ValueError("No active host sync")
             if type(request_id) is not int or not 0 <= request_id <= self.config["sync_request"]:
