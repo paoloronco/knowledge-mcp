@@ -4,6 +4,7 @@ import json
 import os
 import re
 import sys
+import threading
 import time
 from contextlib import contextmanager
 from datetime import datetime, timezone
@@ -111,6 +112,7 @@ QDRANT_URL = os.getenv("QDRANT_URL", "http://127.0.0.1:6333")
 CHUNK_SIZE = int(os.getenv("CHUNK_SIZE", "1200"))
 CHUNK_OVERLAP = int(os.getenv("CHUNK_OVERLAP", "200"))
 EMBED_BATCH_SIZE = int(os.getenv("EMBED_BATCH_SIZE", "32"))
+_model_lock = threading.Lock()
 
 
 def load_policy():
@@ -815,13 +817,14 @@ def run_ingestion(args):
 
     def get_model():
         nonlocal model
-        if model is None:
-            write_progress("loading_model", force=True)
-            from sentence_transformers import SentenceTransformer
+        with _model_lock:
+            if model is None:
+                write_progress("loading_model", force=True)
+                from sentence_transformers import SentenceTransformer
 
-            device = embedding_device()
-            print(f"Loading {MODEL_NAME} on {device}", flush=True)
-            model = SentenceTransformer(MODEL_NAME, device=device)
+                device = embedding_device()
+                print(f"Loading {MODEL_NAME} on {device}", flush=True)
+                model = SentenceTransformer(MODEL_NAME, device=device)
         return model
 
     client = QdrantClient(url=QDRANT_URL, timeout=60)
