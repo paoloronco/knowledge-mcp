@@ -91,7 +91,7 @@ def stage_restore(source, roots, qdrant_version=None):
                 is_outside_roots = path.parts[0] not in roots
                 has_traversal = any(part in ("", ".", "..") for part in path.parts)
                 has_restore_prefix = any(part.startswith(".restore-") for part in path.parts)
-                is_duplicate = member.name in seen
+                is_duplicate = path.as_posix() in seen
                 is_bad_type = not (member.isfile() or member.isdir())
                 is_negative_size = member.size < 0
                 is_dir_with_size = member.isdir() and member.size != 0
@@ -100,7 +100,7 @@ def stage_restore(source, roots, qdrant_version=None):
                         or has_restore_prefix or is_duplicate or is_bad_type or is_negative_size
                         or is_dir_with_size or has_windows_chars):
                     raise ValueError("Backup contains an unsafe path or file type")
-                seen.add(member.name)
+                seen.add(path.as_posix())
                 if len(path.parts) == 1:
                     if not member.isdir():
                         raise ValueError("Backup volume must be a directory")

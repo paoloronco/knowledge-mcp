@@ -92,6 +92,30 @@ class BackupTest(unittest.TestCase):
                 self.assertEqual((roots["qdrant"] / "vectors.bin").read_bytes(), b'vectors')
                 self.assertFalse(list(roots["data"].glob('.restore-*')))
 
+    def test_duplicate_normalized_paths_are_rejected(self):
+        with tempfile.TemporaryDirectory() as folder:
+            base = Path(folder)
+            roots = {name: base / name for name in ('data', 'qdrant', 'agent')}
+            for root in roots.values():
+                root.mkdir()
+            archive = base / 'backup.tar.gz'
+            with tarfile.open(archive, 'w:gz') as output:
+                manifest = json.dumps({'format': 'knowledge-mcp-backup', 'version': backup.FORMAT_VERSION, 'roots': sorted(roots), 'qdrant_version': None}).encode()
+                item = tarfile.TarInfo('manifest.json')
+                item.size = len(manifest)
+                output.addfile(item, io.BytesIO(manifest))
+                root = tarfile.TarInfo('data')
+                root.type = tarfile.DIRTYPE
+                output.addfile(root)
+                for name in ('data/config.json', 'data//config.json'):
+                    payload = b'content'
+                    item = tarfile.TarInfo(name)
+                    item.size = len(payload)
+                    output.addfile(item, io.BytesIO(payload))
+            with self.assertRaisesRegex(ValueError, 'unsafe path or file type'):
+                backup.stage_restore(archive, roots)
+            self.assertFalse(list(base.glob('**/.restore-*')))
+
     def test_http_export_import_auth_and_service_pause(self):
         with tempfile.TemporaryDirectory() as folder, ExitStack() as stack:
             base = Path(folder)
