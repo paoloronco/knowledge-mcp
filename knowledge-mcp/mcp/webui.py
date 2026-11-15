@@ -27,7 +27,12 @@ import yaml
 from host_sync import allowed_file, host_root, is_office_lock_file, relative_path, cached_file_hash
 from embedding_models import DEFAULT_MODEL, MODELS
 from gpu_probe import GPU_MONITOR
-from policy_defaults import ensure_required_exclusions, remove_legacy_default_exclusions
+from policy_defaults import (
+    REQUIRED_DIRECTORY_NAMES,
+    REQUIRED_TOP_LEVEL_NAMES,
+    ensure_required_exclusions,
+    remove_legacy_default_exclusions,
+)
 from backup import MAX_UNPACKED_SIZE, create_backup, stage_restore, apply_restore
 from retrieval import invalidate_policy_cache
 
@@ -70,8 +75,7 @@ def validate_source_root(value):
         raise ValueError("Application data cannot be indexed")
     if not path.is_dir():
         raise ValueError(f"{path} is not visible inside the container. Mount the host folder read-only at this path and recreate the container.")
-    default = yaml.safe_load(DEFAULT_POLICY.read_text(encoding="utf-8"))
-    restricted = {name.casefold() for name in default["exclude_directories"] + default["exclude_top_level"]}
+    restricted = REQUIRED_DIRECTORY_NAMES | REQUIRED_TOP_LEVEL_NAMES
     if any(part.casefold() in restricted for part in path.parts):
         raise ValueError("This path is excluded by the indexing policy")
     return path
@@ -385,9 +389,12 @@ class Controller:
     def check_password(self, password):
         if not isinstance(password, str) or not AUTH.exists():
             return False
-        record = json.loads(AUTH.read_text(encoding="utf-8"))
-        digest = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), bytes.fromhex(record["salt"]), 600000)
-        return hmac.compare_digest(digest, bytes.fromhex(record["hash"]))
+        try:
+            record = json.loads(AUTH.read_text(encoding="utf-8"))
+            digest = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), bytes.fromhex(record["salt"]), 600000)
+            return hmac.compare_digest(digest, bytes.fromhex(record["hash"]))
+        except (OSError, ValueError, KeyError, TypeError):
+            return False
 
     def complete_onboarding(self):
         with self.lock:
@@ -1051,12 +1058,12 @@ class Controller:
 
     def status(self):
         try:
-            with urllib.request.urlopen(os.getenv("QDRANT_URL", "http://127.0.0.1:6333").rstrip("/") + "/readyz", timeout=2) as response:
+            with urllib.request.urlopen(os.getenv("QDRANT_URL", "http://127.0.0.1:6333").rstrip("/") + "/readyz", timeout=1) as response:
                 qdrant = response.status == 200
         except Exception:
             qdrant = False
         try:
-            with socket.create_connection(("127.0.0.1", int(os.getenv("MCP_PORT", "8000"))), timeout=1):
+            with socket.create_connection(("127.0.0.1", int(os.getenv("MCP_PORT", "8000"))), timeout=0.5):
                 mcp_reachable = True
         except OSError:
             mcp_reachable = False
