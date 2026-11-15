@@ -10,6 +10,8 @@ from retrieval import (
     DENSE_COLLECTION,
     MODEL_NAME,
     client,
+    index_available,
+    legacy_chunk_count,
     search,
     browse_documents,
     read_document,
@@ -35,59 +37,51 @@ mcp = MCPServer(
 @mcp.tool()
 def knowledge_status() -> dict:
     """Check Qdrant availability and the current collection size."""
+    result = {
+        "status": "unavailable",
+        "backend": "qdrant-hybrid",
+        "retrieval": "dense + sparse lexical with reciprocal rank fusion",
+        "dense_embedding_model": MODEL_NAME,
+        "dense_collection": DENSE_COLLECTION,
+        "indexed_chunks": None,
+        "indexed_documents": None,
+        "index_version": INDEX_VERSION,
+        "index_update_required": None,
+        "navigation": ["browse_private_knowledge", "read_private_document"],
+        "reason": None,
+    }
     try:
+        if not index_available():
+            result.update(
+                status="empty",
+                indexed_chunks=0,
+                indexed_documents=0,
+                index_update_required=True,
+                message="No index is available yet. Run an initial indexing job.",
+            )
+            return result
         info = client.get_collection(DENSE_COLLECTION)
-        indexed_chunks = client.count(DENSE_COLLECTION, exact=False).count
-        legacy_chunks = client.count(
-            DENSE_COLLECTION,
-            count_filter=models.Filter(
-                must_not=[
-                    models.Filter(
-                        must=[
-                            models.FieldCondition(
-                                key="index_version",
-                                match=models.MatchValue(value=INDEX_VERSION),
-                            ),
-                            models.FieldCondition(
-                                key="embedding_model",
-                                match=models.MatchValue(value=MODEL_NAME),
-                            ),
-                        ]
-                    )
-                ]
-            ),
-            exact=False,
-        ).count
         filters = query_filter(load_policy())
         filters.must.append(
             models.FieldCondition(
                 key="document_order", match=models.MatchValue(value=0)
             )
         )
-        indexed_documents = client.count(
-            DENSE_COLLECTION, count_filter=filters, exact=False
-        ).count
-        update_required = legacy_chunks > 0 or LEXICAL_VECTOR not in (
-            info.config.params.sparse_vectors or {}
+        result.update(
+            indexed_chunks=client.count(DENSE_COLLECTION, exact=False).count,
+            indexed_documents=client.count(
+                DENSE_COLLECTION, count_filter=filters, exact=False
+            ).count,
+            index_update_required=legacy_chunk_count() > 0
+            or LEXICAL_VECTOR not in (info.config.params.sparse_vectors or {}),
+            status="ok",
         )
-        status = "ok"
-    except Exception:
-        indexed_chunks = None
-        indexed_documents = None
-        update_required = None
-        status = "unavailable"
-    return {
-        "status": status,
-        "backend": "qdrant-hybrid",
-        "retrieval": "dense + sparse lexical with reciprocal rank fusion",
-        "dense_embedding_model": MODEL_NAME,
-        "dense_collection": DENSE_COLLECTION,
-        "indexed_chunks": indexed_chunks,
-        "indexed_documents": indexed_documents,
-        "index_version": INDEX_VERSION,
-        "index_update_required": update_required,
-        "navigation": ["browse_private_knowledge", "read_private_document"],
-    }
+    except Exception as exc:
+        result["reason"] = type(exc).__name__
+        result["indexed_chunks"] = None
+        result["indexed_documents"] = None
+        result["index_update_required"] = None
+    return result
 
 
 @mcp.tool()

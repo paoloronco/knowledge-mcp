@@ -210,6 +210,27 @@ def query_filter(policy, include_historical=False, path_prefix="", source=""):
     return models.Filter(must=must, must_not=must_not)
 
 
+def index_available():
+    return client.collection_exists(DENSE_COLLECTION)
+
+
+def legacy_chunk_count():
+    return client.count(
+        DENSE_COLLECTION,
+        count_filter=models.Filter(
+            must_not=[
+                models.Filter(
+                    must=[
+                        condition("index_version", INDEX_VERSION),
+                        condition("embedding_model", MODEL_NAME),
+                    ]
+                )
+            ]
+        ),
+        exact=False,
+    ).count
+
+
 def sanitize(value):
     if isinstance(value, str):
         return redact_secrets(value)
@@ -253,6 +274,10 @@ def read_document(document_id, start_chunk=0, limit=8, include_historical=False)
         raise ValueError(
             "start_chunk must be nonnegative and limit must be between 1 and 20"
         )
+    if not index_available():
+        return sanitize(
+            {"document_id": document_id, "chunks": [], "next_chunk": None}
+        )
     policy = load_policy()
     filters = query_filter(policy, include_historical)
     filters.must.extend(
@@ -281,7 +306,7 @@ def read_document(document_id, start_chunk=0, limit=8, include_historical=False)
         {
             "document_id": document_id,
             "chunks": [public_chunk(p, policy) for p in page],
-            "next_chunk": page[-1]["document_order"] + 1
+            "next_chunk": visible[limit]["document_order"]
             if len(visible) > limit
             else None,
         }
@@ -298,6 +323,10 @@ def browse_documents(path_prefix="", limit=30, cursor=None, include_historical=F
         or not 0 <= int(cursor) < 2**64
     ):
         raise ValueError("Use next_cursor from the previous browse response")
+    if not index_available():
+        return sanitize(
+            {"path_prefix": path_prefix, "documents": [], "next_cursor": None}
+        )
     policy = load_policy()
     filters = query_filter(policy, include_historical, path_prefix)
     filters.must.append(condition("document_order", 0))
@@ -371,7 +400,7 @@ def search(
     )
     policy = load_policy()
     filters = query_filter(policy, historical, path_prefix, source)
-    if not client.collection_exists(DENSE_COLLECTION):
+    if not index_available():
         return sanitize(
             {
                 "query": query,
@@ -384,13 +413,15 @@ def search(
     info = client.get_collection(DENSE_COLLECTION)
     lexical_available = LEXICAL_VECTOR in (info.config.params.sparse_vectors or {})
     if not lexical_available:
-        return {
-            "query": query,
-            "results": [],
-            "result_count": 0,
-            "index_update_required": True,
-            "message": "Run incremental indexing to upgrade this collection for hybrid search and navigation.",
-        }
+        return sanitize(
+            {
+                "query": query,
+                "results": [],
+                "result_count": 0,
+                "index_update_required": True,
+                "message": "Run incremental indexing to upgrade this collection for hybrid search and navigation.",
+            }
+        )
     global model
     with _model_lock:
         if model is None:
