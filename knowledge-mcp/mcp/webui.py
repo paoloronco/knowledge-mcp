@@ -228,6 +228,7 @@ class Controller:
         self.sync_hash_cache = {}
         self.stopping = False
         self.restart_requested = False
+        self.maintenance = False
         self.backup_download = None
         self.qdrant = None
         self.mcp = None
@@ -264,9 +265,25 @@ class Controller:
         return subprocess.check_output(["/qdrant/qdrant", "--version"], text=True, timeout=5).strip()
 
     def discard_backup_download(self):
-        if self.backup_download:
-            self.backup_download[1].unlink(missing_ok=True)
-            self.backup_download = None
+        with self.lock:
+            if self.backup_download:
+                self.backup_download[1].unlink(missing_ok=True)
+                self.backup_download = None
+
+    def set_backup_download(self, key, archive, expires_at):
+        with self.lock:
+            self.discard_backup_download()
+            self.backup_download = (key, archive, expires_at)
+
+    def discard_backup_archive(self, archive):
+        with self.lock:
+            if self.backup_download and self.backup_download[1] == archive:
+                self.backup_download = None
+
+    def request_restart(self):
+        with self.lock:
+            self.stopping = True
+            self.restart_requested = True
 
     def validate_backup_settings(self, stages):
         data = stages["data"]
@@ -326,6 +343,8 @@ class Controller:
     @contextmanager
     def backup_pause(self):
         with self.lock:
+            if self.maintenance:
+                raise ValueError("Another backup or restore is in progress")
             if self.sync_in_progress or self.local_scan["running"] or self.folder_probe is not None or self.ingest and self.ingest.poll() is None:
                 raise ValueError("Wait until indexing, scanning and folder synchronization finish")
             if self.ingest and not self.ingest_finalized:
@@ -333,11 +352,14 @@ class Controller:
             self._save()
             qdrant_running = bool(self.qdrant and self.qdrant.poll() is None)
             mcp_running = bool(self.mcp and self.mcp.poll() is None)
-            try:
-                self._stop_mcp()
-                self._stop_qdrant()
-                yield
-            finally:
+            self._stop_mcp()
+            self._stop_qdrant()
+            self.maintenance = True
+        try:
+            yield
+        finally:
+            with self.lock:
+                self.maintenance = False
                 if not self.stopping:
                     if qdrant_running:
                         self._start_qdrant()
@@ -1081,6 +1103,7 @@ class Controller:
                 "embedding_device_preference": os.getenv("EMBEDDING_DEVICE", "auto"),
                 "document_paths": document_paths(self.config),
                 "app_ready": True,
+                "maintenance": self.maintenance,
                 "qdrant_ready": qdrant,
                 "qdrant_managed": Path("/qdrant/qdrant").exists(),
                 "qdrant_running": bool(self.qdrant and self.qdrant.poll() is None) if Path("/qdrant/qdrant").exists() else qdrant,
@@ -1232,7 +1255,11 @@ class Handler(BaseHTTPRequestHandler):
             return
         if self.path == "/api/health":
             status = controller.status()
-            self.send(200 if status["app_ready"] and status["qdrant_ready"] else 503, json.dumps({"app_ready": status["app_ready"], "qdrant_ready": status["qdrant_ready"], "mcp_running": status["mcp_running"]}))
+            maintenance = status.get("maintenance", False)
+            healthy = status["app_ready"] and (
+                status["qdrant_ready"] or maintenance
+            )
+            self.send(200 if healthy else 503, json.dumps({"app_ready": status["app_ready"], "qdrant_ready": status["qdrant_ready"], "mcp_running": status["mcp_running"], "maintenance": maintenance}))
             return
         if self.path == "/" or self.path in SETUP_PATHS or self.path in DASHBOARD_PATHS:
             token = CONTROL_TOKEN if self._authenticated() else ""
@@ -1308,12 +1335,17 @@ class Handler(BaseHTTPRequestHandler):
             self.send(403, json.dumps({"error": "Unauthorized request"}))
             return
         self.connection.settimeout(30)
-        # ponytail: serialize mutations during backup; use a maintenance gate if uploads need concurrency.
         with controller.lock:
             if controller.stopping:
                 self.send(503, json.dumps({"error": "Application is restarting"}))
                 return
-            self._post()
+            if getattr(controller, "maintenance", False):
+                self.send(503, json.dumps({"error": "A backup or restore is in progress; retry shortly"}))
+                return
+            if route not in ("/api/agent/file", "/api/backup", "/api/restore"):
+                self._post()
+                return
+        self._post()
 
     def _post(self):
         if not self._allowed_host():
@@ -1393,13 +1425,11 @@ class Handler(BaseHTTPRequestHandler):
                     try:
                         with controller.backup_pause():
                             create_backup(archive, roots, version)
-                        controller.discard_backup_download()
                         key = secrets.token_urlsafe(32)
-                        controller.backup_download = (key, archive, time.time() + 600)
+                        controller.set_backup_download(key, archive, time.time() + 600)
                         self.send(200, json.dumps({"url": "/api/backup/download?id=" + key}))
                     except Exception:
-                        if controller.backup_download and controller.backup_download[1] == archive:
-                            controller.backup_download = None
+                        controller.discard_backup_archive(archive)
                         archive.unlink(missing_ok=True)
                         raise
                     return
@@ -1421,8 +1451,7 @@ class Handler(BaseHTTPRequestHandler):
                             controller.validate_backup_settings(stages)
                             with controller.backup_pause():
                                 apply_restore(stages, roots)
-                                controller.stopping = True
-                                controller.restart_requested = True
+                                controller.request_restart()
                         finally:
                             for stage in stages.values():
                                 shutil.rmtree(stage, ignore_errors=True)
