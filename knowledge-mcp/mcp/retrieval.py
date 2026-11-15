@@ -30,6 +30,7 @@ DENSE_LIMIT = 80
 LEXICAL_LIMIT = 80
 FINAL_LIMIT = 8
 MAX_CONTEXT_CHARS = 6000
+BACKEND_MESSAGE = "Qdrant is unavailable. Check the service and retry."
 client = QdrantClient(url=QDRANT_URL, timeout=30)
 model = None
 _model_lock = threading.Lock()
@@ -214,6 +215,17 @@ def index_available():
     return client.collection_exists(DENSE_COLLECTION)
 
 
+def backend_failure(exc, **fields):
+    return sanitize(
+        {
+            **fields,
+            "backend": "unavailable",
+            "reason": type(exc).__name__,
+            "message": BACKEND_MESSAGE,
+        }
+    )
+
+
 def legacy_chunk_count():
     return client.count(
         DENSE_COLLECTION,
@@ -274,7 +286,13 @@ def read_document(document_id, start_chunk=0, limit=8, include_historical=False)
         raise ValueError(
             "start_chunk must be nonnegative and limit must be between 1 and 20"
         )
-    if not index_available():
+    try:
+        available = index_available()
+    except Exception as exc:
+        return backend_failure(
+            exc, document_id=document_id, chunks=[], next_chunk=None
+        )
+    if not available:
         return sanitize(
             {"document_id": document_id, "chunks": [], "next_chunk": None}
         )
@@ -323,7 +341,13 @@ def browse_documents(path_prefix="", limit=30, cursor=None, include_historical=F
         or not 0 <= int(cursor) < 2**64
     ):
         raise ValueError("Use next_cursor from the previous browse response")
-    if not index_available():
+    try:
+        available = index_available()
+    except Exception as exc:
+        return backend_failure(
+            exc, path_prefix=path_prefix, documents=[], next_cursor=None
+        )
+    if not available:
         return sanitize(
             {"path_prefix": path_prefix, "documents": [], "next_cursor": None}
         )
@@ -400,7 +424,11 @@ def search(
     )
     policy = load_policy()
     filters = query_filter(policy, historical, path_prefix, source)
-    if not index_available():
+    try:
+        available = index_available()
+    except Exception as exc:
+        return backend_failure(exc, query=query, results=[], result_count=0)
+    if not available:
         return sanitize(
             {
                 "query": query,

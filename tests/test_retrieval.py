@@ -369,6 +369,22 @@ class IndexingAndNavigationTest(unittest.TestCase):
             {"large.md", "small.md"},
         )
 
+    def test_tools_report_a_backend_outage_instead_of_raising(self):
+        broken = types.SimpleNamespace(
+            collection_exists=lambda name: (_ for _ in ()).throw(
+                RuntimeError("qdrant down")
+            )
+        )
+        with patch.object(retrieval, "client", broken):
+            search = retrieval.search("telescope")
+            browse = retrieval.browse_documents()
+            read = retrieval.read_document("a" * 64)
+        self.assertEqual(search["backend"], "unavailable")
+        self.assertEqual(search["reason"], "RuntimeError")
+        self.assertEqual(search["results"], [])
+        self.assertEqual(browse["documents"], [])
+        self.assertEqual(read["chunks"], [])
+
     def test_search_reports_a_missing_index_instead_of_raising(self):
         result = retrieval.search("telescope")
         self.assertTrue(result["index_update_required"])
