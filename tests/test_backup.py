@@ -125,7 +125,7 @@ class BackupTest(unittest.TestCase):
             worker.start()
             url = f'http://127.0.0.1:{server.server_port}'
 
-            def post(route, contents=b'', token=app.TOKEN):
+            def post(route, contents=b'', token=app.CONTROL_TOKEN):
                 return urllib.request.urlopen(urllib.request.Request(url + route, data=contents, headers={'X-Control-Token': token}), timeout=5)
 
             try:

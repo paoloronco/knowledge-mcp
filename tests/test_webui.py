@@ -187,7 +187,7 @@ class AdminBoundaryTest(unittest.TestCase):
                             self.assertEqual(response.geturl(), url + "/dashboard/settings")
 
                         def post(route, body, cookie=""):
-                            headers = {"Content-Type": "application/json", "X-Control-Token": app.TOKEN}
+                            headers = {"Content-Type": "application/json", "X-Control-Token": app.CONTROL_TOKEN}
                             if cookie:
                                 headers["Cookie"] = cookie
                             request = urllib.request.Request(url + route, data=json.dumps(body).encode(), headers=headers)
@@ -589,7 +589,7 @@ class AdminBoundaryTest(unittest.TestCase):
                         url = f"http://127.0.0.1:{server.server_port}"
                         with urllib.request.urlopen(url) as response:
                             page = response.read().decode()
-                            self.assertIn(app.TOKEN, page)
+                            self.assertIn(app.CONTROL_TOKEN, page)
                             self.assertIn('lang="en"', page)
                             self.assertEqual(page.count('type="file"'), 1)
                             self.assertIn('id="backup-file" type="file" accept=".tar.gz,application/gzip"', page)
@@ -604,11 +604,11 @@ class AdminBoundaryTest(unittest.TestCase):
                         with self.assertRaises(urllib.error.HTTPError) as denied:
                             urllib.request.urlopen(request)
                         self.assertEqual(denied.exception.code, 403)
-                        request.add_header("X-Control-Token", app.TOKEN)
+                        request.add_header("X-Control-Token", app.CONTROL_TOKEN)
                         request.add_header("Host", "10.10.10.80:8080")
                         with urllib.request.urlopen(request) as response:
                             self.assertEqual(response.status, 200)
-                        upload = urllib.request.Request(url + "/api/upload?path=notes%2Fexample.md", data=b"Example document", headers={"X-Control-Token": app.TOKEN})
+                        upload = urllib.request.Request(url + "/api/upload?path=notes%2Fexample.md", data=b"Example document", headers={"X-Control-Token": app.CONTROL_TOKEN})
                         with self.assertRaises(urllib.error.HTTPError) as denied:
                             urllib.request.urlopen(upload)
                         self.assertEqual(denied.exception.code, 404)
@@ -617,7 +617,7 @@ class AdminBoundaryTest(unittest.TestCase):
                         self.assertNotIn("Generate pairing key", page)
                         (source / "notes").mkdir()
                         config = {"folders": [str(source / "notes")], "interval_hours": 2}
-                        request = urllib.request.Request(url + "/api/config", data=json.dumps(config).encode(), headers={"Content-Type": "application/json", "X-Control-Token": app.TOKEN})
+                        request = urllib.request.Request(url + "/api/config", data=json.dumps(config).encode(), headers={"Content-Type": "application/json", "X-Control-Token": app.CONTROL_TOKEN})
                         with urllib.request.urlopen(request) as response:
                             self.assertEqual(json.load(response)["folders"], ["notes"])
                         self.assertEqual(json.loads((data / "config.json").read_text())["folders"], ["notes"])
@@ -626,7 +626,7 @@ class AdminBoundaryTest(unittest.TestCase):
                         policy_request = urllib.request.Request(
                             url + "/api/policy",
                             data=json.dumps({"content": app.DEFAULT_POLICY.read_text(encoding="utf-8")}).encode(),
-                            headers={"Content-Type": "application/json", "X-Control-Token": app.TOKEN},
+                            headers={"Content-Type": "application/json", "X-Control-Token": app.CONTROL_TOKEN},
                         )
                         with urllib.request.urlopen(policy_request) as response:
                             self.assertEqual(response.status, 200)
@@ -657,7 +657,7 @@ class AdminBoundaryTest(unittest.TestCase):
                     try:
                         url = f"http://127.0.0.1:{server.server_port}"
                         with urllib.request.urlopen(url) as response:
-                            self.assertNotIn(app.TOKEN, response.read().decode())
+                            self.assertNotIn(app.CONTROL_TOKEN, response.read().decode())
                         with self.assertRaises(urllib.error.HTTPError) as denied:
                             urllib.request.urlopen(url + "/api/status")
                         self.assertEqual(denied.exception.code, 401)
