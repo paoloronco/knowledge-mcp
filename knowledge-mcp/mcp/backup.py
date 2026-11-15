@@ -6,9 +6,12 @@ import json
 import shutil
 import tarfile
 import tempfile
+import threading
 import zlib
 from pathlib import Path, PurePosixPath
 
+
+_FORMAT_LOCK = threading.Lock()
 
 FORMAT_VERSION = 2
 MAX_UNPACKED_SIZE = 100 * 1024**3
@@ -16,6 +19,11 @@ MAX_MEMBERS = 250_000
 
 
 def create_backup(destination, roots, qdrant_version=None):
+    with _FORMAT_LOCK:
+        return _create_backup_unlocked(destination, roots, qdrant_version)
+
+
+def _create_backup_unlocked(destination, roots, qdrant_version=None):
     manifest = json.dumps({"format": "knowledge-mcp-backup", "version": FORMAT_VERSION, "roots": sorted(roots), "qdrant_version": qdrant_version}).encode()
     count, total = 1, 0
     with tarfile.open(destination, "w:gz", dereference=True) as archive:
