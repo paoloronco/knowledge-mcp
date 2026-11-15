@@ -62,4 +62,4 @@ sudo systemctl enable --now knowledge-mcp
 sudo journalctl -u knowledge-mcp -f
 ~~~
 
-After every ingestion run, restart knowledge-mcp to reload the lexical corpus. Check Qdrant's /readyz endpoint and call the MCP knowledge_status tool with a real MCP client; a plain GET is not a tool call. Put an authenticated HTTPS proxy or Cloudflare Access in front of any remote endpoint. See the [Cloudflare guide](../../../docs/cloudflare-access.md).
+Search reads the live Qdrant collection on each request, so subsequent ingestion runs need no MCP restart. After upgrading from an older release, run one incremental update per model index to add the lexical and navigation indexes. Check Qdrant's /readyz endpoint and call the MCP knowledge_status tool with a real MCP client; a plain GET is not a tool call. Put an authenticated HTTPS proxy or Cloudflare Access in front of any remote endpoint. See the [Cloudflare guide](../../../docs/cloudflare-access.md).

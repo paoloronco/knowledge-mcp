@@ -1146,7 +1146,16 @@ class Handler(BaseHTTPRequestHandler):
     def _allowed_host(self):
         try:
             host = urlsplit("//" + self.headers.get("Host", "")).hostname
+            if not isinstance(host, str):
+                return False
             if host == "localhost":
+                return True
+            allowed = {
+                name.strip().casefold()
+                for name in os.getenv("WEBUI_ALLOWED_HOSTS", "").split(",")
+                if name.strip()
+            }
+            if host.casefold() in allowed:
                 return True
             ipaddress.ip_address(host)
             return True
@@ -1418,19 +1427,19 @@ class Handler(BaseHTTPRequestHandler):
             values = json.loads(self.rfile.read(length))
             if not isinstance(values, dict):
                 raise ValueError("Invalid data")
-            if self.path == "/api/config":
+            if route.path == "/api/config":
                 result = controller.update(values)
-            elif self.path == "/api/embedding-model":
+            elif route.path == "/api/embedding-model":
                 result = controller.select_embedding_model(values.get("model"))
-            elif self.path == "/api/agent/pair":
+            elif route.path == "/api/agent/pair":
                 result = controller.agent_pair()
-            elif self.path == "/api/agent/refresh":
+            elif route.path == "/api/agent/refresh":
                 result = controller.request_agent_sync()
-            elif self.path == "/api/scan":
+            elif route.path == "/api/scan":
                 result = controller.start_scan()
-            elif self.path == "/api/folder/check":
+            elif route.path == "/api/folder/check":
                 result = controller.check_folder(values.get("path"), values.get("source_selection", controller.config["source_selection"]))
-            elif self.path == "/api/security":
+            elif route.path == "/api/security":
                 if values.get("enabled") is True:
                     controller.set_password(values.get("password"))
                 elif values.get("enabled") is False:
@@ -1441,20 +1450,20 @@ class Handler(BaseHTTPRequestHandler):
                 else:
                     raise ValueError("Invalid security setting")
                 result = {"enabled": controller.password_enabled()}
-            elif self.path == "/api/onboarding":
+            elif route.path == "/api/onboarding":
                 controller.complete_onboarding()
                 result = {"complete": True}
-            elif self.path == "/api/onboarding/skip-index":
+            elif route.path == "/api/onboarding/skip-index":
                 controller.skip_initial_index()
                 result = {"complete": True, "initial_index_skipped": True}
-            elif self.path == "/api/onboarding/progress":
+            elif route.path == "/api/onboarding/progress":
                 result = controller.advance_setup(values.get("step"))
-            elif self.path == "/api/service":
+            elif route.path == "/api/service":
                 result = controller.service(values.get("name"), values.get("action"))
-            elif self.path == "/api/index":
+            elif route.path == "/api/index":
                 controller.run_index(values.get("dry_run") is True, rebuild=values.get("rebuild") is True)
                 result = {"started": True}
-            elif self.path == "/api/policy":
+            elif route.path == "/api/policy":
                 content = values.get("content")
                 if isinstance(values.get("policy"), dict):
                     content = yaml.safe_dump(values["policy"], sort_keys=False, allow_unicode=True)
