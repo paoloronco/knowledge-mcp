@@ -374,6 +374,53 @@ class IndexingAndNavigationTest(unittest.TestCase):
         self.assertTrue(result["index_update_required"])
         self.assertEqual(result["results"], [])
         self.assertEqual(result["result_count"], 0)
+        self.assertEqual(retrieval.browse_documents()["documents"], [])
+        self.assertIsNone(retrieval.browse_documents()["next_cursor"])
+        self.assertEqual(
+            retrieval.read_document("a" * 64)["chunks"], []
+        )
+        self.assertIsNone(retrieval.read_document("a" * 64)["next_chunk"])
+
+    def test_read_document_uses_the_next_chunk_order_as_cursor(self):
+        from index_schema import ensure_search_schema, source_metadata
+
+        self.client.create_collection(
+            ingest.COLLECTION_NAME,
+            models.VectorParams(size=3, distance=models.Distance.COSINE),
+        )
+        ensure_search_schema(self.client, ingest.COLLECTION_NAME)
+        identity = "b" * 64
+        source = "notes/gaps.md"
+        points = []
+        for order in (0, 5, 9):
+            payload = {
+                **source_metadata(source),
+                "document_id": identity,
+                "source": source,
+                "filename": "gaps.md",
+                "extension": ".md",
+                "section_index": 0,
+                "chunk_index": 0,
+                "document_order": order,
+                "total_chunks": 3,
+                "ready": True,
+                "embedding_model": ingest.MODEL_NAME,
+                "text": f"chunk {order}",
+            }
+            points.append(
+                models.PointStruct(
+                    id=order + 1,
+                    vector={"": [1.0, 0.0, 0.0], "lexical": sparse_vector(f"chunk {order}", source)},
+                    payload=payload,
+                )
+            )
+        self.client.upsert(ingest.COLLECTION_NAME, points)
+        first = retrieval.read_document(identity, 0, 1)
+        self.assertEqual(first["next_chunk"], 5)
+        second = retrieval.read_document(identity, first["next_chunk"], 1)
+        self.assertEqual(second["next_chunk"], 9)
+        third = retrieval.read_document(identity, second["next_chunk"], 1)
+        self.assertIsNone(third["next_chunk"])
 
     def test_deleted_documents_are_pruned_even_if_another_replacement_fails(self):
         removed = self.write("removed.md", "A document that will be removed.")

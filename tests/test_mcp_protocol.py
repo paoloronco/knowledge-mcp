@@ -12,7 +12,7 @@ import types
 import unittest
 import warnings
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import uvicorn
 from qdrant_client import QdrantClient
@@ -26,6 +26,27 @@ import ingest
 import retrieval
 import server as knowledge_server
 from test_core import FakeModel
+
+
+class KnowledgeStatusTest(unittest.TestCase):
+    def test_missing_collection_is_reported_as_an_empty_index(self):
+        client = QdrantClient(":memory:")
+        self.addCleanup(client.close)
+        with patch.object(retrieval, "client", client), patch.object(knowledge_server, "client", client):
+            result = knowledge_server.knowledge_status()
+        self.assertEqual(result["status"], "empty")
+        self.assertTrue(result["index_update_required"])
+        self.assertEqual(result["indexed_chunks"], 0)
+        self.assertIsNone(result["reason"])
+
+    def test_backend_failure_exposes_the_exception_class(self):
+        broken = Mock()
+        broken.collection_exists.side_effect = RuntimeError("qdrant unavailable")
+        with patch.object(retrieval, "client", broken), patch.object(knowledge_server, "client", broken):
+            result = knowledge_server.knowledge_status()
+        self.assertEqual(result["status"], "unavailable")
+        self.assertEqual(result["reason"], "RuntimeError")
+        self.assertIsNone(result["indexed_chunks"])
 
 
 class MCPProtocolTest(unittest.IsolatedAsyncioTestCase):

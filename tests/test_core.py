@@ -5,7 +5,7 @@ import tempfile
 import types
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from qdrant_client import QdrantClient
 import yaml
@@ -165,6 +165,22 @@ class CoreFlowTest(unittest.TestCase):
             event = json.loads(run_errors.read_text(encoding="utf-8"))
             self.assertEqual(event["source"], "<index maintenance>")
             self.assertEqual(event["stage"], "cleanup")
+
+    def test_unreadable_file_aborts_discovery_instead_of_looking_deleted(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            with patch.dict(os.environ, {"KNOWLEDGE_ROOT": str(root)}):
+                policy = ingest.load_policy()
+            document = Mock()
+            document.is_symlink.return_value = False
+            document.is_file.return_value = True
+            document.resolve.return_value = root / "note.md"
+            document.relative_to.return_value = Path("note.md")
+            document.name = "note.md"
+            document.suffix = ".md"
+            document.stat.side_effect = OSError("gone")
+            with self.assertRaisesRegex(OSError, "Document scan incomplete"):
+                ingest.is_candidate(document, root, policy)
 
     def test_expansion_stays_in_section(self):
         selected = {"document_id": "a" * 64, "section_index": 0, "document_order": 0, "text": "relevant"}

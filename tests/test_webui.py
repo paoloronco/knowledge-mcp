@@ -274,7 +274,89 @@ class AdminBoundaryTest(unittest.TestCase):
                             self.assertNotIn("Secure", response.headers["Set-Cookie"])
                             cookie = response.headers["Set-Cookie"].split(";", 1)[0]
                         self.assertEqual(post("/api/embedding-model", change, {"X-Control-Token": app.CONTROL_TOKEN, "Cookie": cookie}), 200)
+                        with urllib.request.urlopen(
+                            urllib.request.Request(url + "/api/status", headers={"Cookie": "other=1;" + cookie}),
+                            timeout=5,
+                        ) as response:
+                            self.assertEqual(response.status, 200)
                     finally:
+                        server.shutdown()
+                        server.server_close()
+                        controller.close()
+
+    def test_backup_pause_releases_the_lock_while_the_archive_is_written(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            data = Path(tmp) / "data"
+            source = data / "documents"
+            source.mkdir(parents=True)
+            with (
+                patch.object(app, "DATA", data), patch.object(app, "SOURCE", source),
+                patch.object(app, "MANAGED_SOURCE", source), patch.object(app, "HOST_SOURCE", data / "host-documents"),
+                patch.object(app, "CONFIG", data / "config.json"), patch.object(app, "POLICY", data / "index-policy.yaml"),
+                patch.object(app, "AUTH", data / "auth.json"), patch.object(app, "AGENT_AUTH", data / "agent-auth.json"),
+                patch.object(app, "AGENT_MANIFEST", data / "agent-manifest.json"),
+                patch.object(app, "AUTO_AGENT_CONFIG", None),
+                patch.object(app.Controller, "_schedule", lambda self: None),
+            ):
+                controller = app.Controller()
+                entered, release = threading.Event(), threading.Event()
+
+                def hold():
+                    entered.set()
+                    release.wait(5)
+
+                def run():
+                    with controller.backup_pause():
+                        hold()
+
+                worker = threading.Thread(target=run, daemon=True)
+                worker.start()
+                try:
+                    self.assertTrue(entered.wait(5))
+                    self.assertTrue(controller.maintenance)
+                    acquired = controller.lock.acquire(timeout=1)
+                    self.assertTrue(acquired)
+                    if acquired:
+                        controller.lock.release()
+                finally:
+                    release.set()
+                    worker.join(timeout=5)
+                self.assertFalse(controller.maintenance)
+                controller.close()
+
+    def test_maintenance_gate_blocks_mutations_without_freezing_status(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            data = Path(tmp) / "data"
+            source = data / "documents"
+            source.mkdir(parents=True)
+            with (
+                patch.object(app, "DATA", data), patch.object(app, "SOURCE", source),
+                patch.object(app, "MANAGED_SOURCE", source), patch.object(app, "HOST_SOURCE", data / "host-documents"),
+                patch.object(app, "CONFIG", data / "config.json"), patch.object(app, "POLICY", data / "index-policy.yaml"),
+                patch.object(app, "AUTH", data / "auth.json"), patch.object(app, "AGENT_AUTH", data / "agent-auth.json"),
+                patch.object(app, "AGENT_MANIFEST", data / "agent-manifest.json"),
+                patch.object(app, "AUTO_AGENT_CONFIG", None),
+                patch.object(app.Controller, "_schedule", lambda self: None),
+            ):
+                controller = app.Controller()
+                with patch.object(app, "controller", controller):
+                    server = ThreadingHTTPServer(("127.0.0.1", 0), app.Handler)
+                    thread = threading.Thread(target=server.serve_forever, daemon=True)
+                    thread.start()
+                    try:
+                        url = f"http://127.0.0.1:{server.server_port}"
+                        controller.maintenance = True
+                        with urllib.request.urlopen(url + "/api/status", timeout=10) as response:
+                            self.assertEqual(response.status, 200)
+                            self.assertTrue(json.load(response)["maintenance"])
+                        with urllib.request.urlopen(url + "/api/health", timeout=10) as response:
+                            self.assertEqual(response.status, 200)
+                        request = urllib.request.Request(url + "/api/config", data=b"{}", headers={"Content-Type": "application/json", "X-Control-Token": app.CONTROL_TOKEN})
+                        with self.assertRaises(urllib.error.HTTPError) as denied:
+                            urllib.request.urlopen(request, timeout=5)
+                        self.assertEqual(denied.exception.code, 503)
+                    finally:
+                        controller.maintenance = False
                         server.shutdown()
                         server.server_close()
                         controller.close()
