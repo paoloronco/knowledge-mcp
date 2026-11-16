@@ -32,13 +32,13 @@ Current retrieval reads Qdrant directly. Check that indexing completed and that 
 
 After recreating the containers, the Documents badge reads `syncing…` (or `waiting for sync`) until the companion rescans the host folders, transfers changed files, and commits the first sync. The overview and Document folders page show the phase and counts; the badge turns `ready` when the sync completes. `docker logs knowledge-mcp-host-agent` records startup, connection, scan results, transfer progress, and completion. If the badge stays `unavailable`, check that the companion is running and paired with `docker ps` and `docker logs knowledge-mcp-host-agent`.
 
-## Empty PDF results
+## Empty PDF results / "Documents were skipped"
 
-The parser extracts embedded text only. It does not OCR scanned pages. Documents without extractable text are reported as indexing errors; short valid passages are retained.
+The parser extracts embedded text only. It does not OCR scanned pages. A PDF made of scanned images, or a slide deck containing only pictures, is **skipped**, not treated as a failure: the run still succeeds, successfully indexed documents remain searchable, and the last usable indexed version of that source is preserved. Skipped files are recorded in the persistent ingestion state with a signature, so they are not re-parsed on later incremental runs (which keeps indexing fast). They appear in **Indexing → View details** under "Skipped: no extractable text", where each entry has an **Ignore this file** action and **Ignore all skipped documents** can exclude them all at once. To make them searchable, run OCR on the source files and save a text-bearing copy; the changed content is then picked up automatically. Short valid passages are still retained.
 
 ## Indexing reaches 100% but reports failures
 
-The percentage counts documents examined, including any that fail parsing or indexing. Documents completed before the error remain in Qdrant, and the next run skips unchanged documents recorded in the persistent ingestion state. The Indexing page shows per-document errors and downloads for the full output and timestamped status log. You can fix a source file or choose **Ignore this file** to add it to the policy before retrying. Older runs may have only the full log; to inspect their per-file errors in a Docker installation, run:
+The percentage counts documents examined, including any that fail parsing or indexing. Documents completed before the error remain in Qdrant: a run with a few genuine errors still activates the index and the selected model. The next run skips unchanged documents recorded in the persistent ingestion state. The Indexing page shows a compact note and opens per-document details in a separate dialog; downloads for the full output and timestamped status log remain available. You can fix a source file or choose **Ignore this file** to add it to the policy before retrying. Older runs may have only the full log; to inspect their per-file errors in a Docker installation, run:
 
 ```bash
 docker exec knowledge-mcp sh -lc 'find /data/ingestion -name errors.log -type f -print -exec tail -n 20 {} \;'

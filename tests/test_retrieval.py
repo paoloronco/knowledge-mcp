@@ -587,18 +587,20 @@ class IndexingAndNavigationTest(unittest.TestCase):
         third = retrieval.read_document(identity, second["next_chunk"], 1)
         self.assertIsNone(third["next_chunk"])
 
-    def test_deleted_documents_are_pruned_even_if_another_replacement_fails(self):
+    def test_deleted_documents_are_pruned_even_if_another_replacement_has_no_text(self):
         removed = self.write("removed.md", "A document that will be removed.")
         broken = self.write("broken.md", "Last usable telescope configuration.")
         self.run_index()
         removed.unlink()
         broken.write_text("   ", encoding="utf-8")
-        with self.assertRaises(SystemExit):
-            self.run_index()
+        self.run_index()
         self.assertEqual(
             [r["source"] for r in retrieval.search("telescope")["results"]],
             ["broken.md"],
         )
+        state = ingest.load_state()["documents"]
+        self.assertTrue(any(entry.get("empty") for entry in state.values()))
+        self.assertFalse(any(entry.get("pending") for entry in state.values()))
 
     def test_duplicate_sources_can_be_used_as_exact_paths_and_folder_scopes(self):
         text = "Qdrant telemetry settings for telescope control."

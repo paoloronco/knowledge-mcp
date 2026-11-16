@@ -453,7 +453,7 @@ class Controller:
             (DATA / "index-progress.json").unlink(missing_ok=True)
 
     def _env(self, model_id=None, indexing=False):
-        env = {**os.environ, "KNOWLEDGE_ROOT": self.config["source_root"], "INDEX_SOURCE_PATHS": json.dumps(self.config["folders"]), "POLICY_FILE": str(POLICY), "INGEST_PROGRESS_FILE": str(DATA / "index-progress.json"), "INGEST_STAGES_FILE": str(DATA / "index-stages.log"), "INGEST_RUN_ERRORS_FILE": str(DATA / "index-errors.jsonl")}
+        env = {**os.environ, "KNOWLEDGE_ROOT": self.config["source_root"], "INDEX_SOURCE_PATHS": json.dumps(self.config["folders"]), "POLICY_FILE": str(POLICY), "INGEST_PROGRESS_FILE": str(DATA / "index-progress.json"), "INGEST_STAGES_FILE": str(DATA / "index-stages.log"), "INGEST_RUN_ERRORS_FILE": str(DATA / "index-errors.jsonl"), "INGEST_SKIPPED_FILE": str(DATA / "index-skipped.jsonl"), "INGEST_SUMMARY_FILE": str(DATA / "index-summary.json")}
         chosen = model_id or self.config["active_embedding_model"] or self.config["embedding_model"]
         if chosen in MODELS:
             spec = MODELS[chosen]
@@ -966,6 +966,8 @@ class Controller:
             self.invalidate_result()
             (DATA / "index-stages.log").write_text("", encoding="utf-8")
             (DATA / "index-errors.jsonl").write_text("", encoding="utf-8")
+            (DATA / "index-skipped.jsonl").write_text("", encoding="utf-8")
+            (DATA / "index-summary.json").unlink(missing_ok=True)
             args = [sys.executable, "ingestion/ingest.py"]
             if dry_run:
                 args += ["--dry-run", "--limit", "10"]
@@ -1000,10 +1002,18 @@ class Controller:
                 self.ingest_finalized = True
             previous_model = self.config.get("active_embedding_model")
             self.last_result = {"exit_code": code, "dry_run": dry_run, "finished_at": time.time()}
-            if code == 0 and not dry_run:
-                self.config["active_embedding_model"] = model_id or self.ingest_model or self.config["embedding_model"]
+            summary = self._index_summary()
+            usable = code == 0 or (
+                not dry_run
+                and isinstance(summary, dict)
+                and summary.get("dry_run") is False
+                and summary.get("indexed", 0) > 0
+            )
+            completed_model = model_id or self.ingest_model or self.config["embedding_model"]
+            if usable and not dry_run:
+                self.config["active_embedding_model"] = completed_model
                 self._save()
-            if code == 0 and not dry_run and self.config["setup_step"] >= 6:
+            if usable and not dry_run and self.config["setup_step"] >= 6:
                 self.config["setup_step"] = 7
                 self.config["initial_index_skipped"] = False
                 self._save()
@@ -1011,8 +1021,7 @@ class Controller:
             tmp = result_file.with_suffix(".tmp")
             tmp.write_text(json.dumps(self.last_result), encoding="utf-8")
             tmp.replace(result_file)
-            completed_model = model_id or self.ingest_model or self.config["embedding_model"]
-            if not dry_run and self.config["mcp_enabled"] and not self.stopping and (self.ingest_rebuild or code == 0 and completed_model != previous_model):
+            if not dry_run and self.config["mcp_enabled"] and not self.stopping and (self.ingest_rebuild or usable and completed_model != previous_model):
                 self._stop_mcp()
                 self._start_mcp()
 
@@ -1092,6 +1101,63 @@ class Controller:
                 entry["can_ignore"] = False
             entry["ignored"] = entry["source"].casefold() in excluded
         return entries, origin
+
+    def _index_summary(self):
+        try:
+            value = json.loads((DATA / "index-summary.json").read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return None
+        return value if isinstance(value, dict) else None
+
+    def index_skipped(self):
+        path = DATA / "index-skipped.jsonl"
+        entries = []
+        if path.is_file():
+            for line in path.read_text(encoding="utf-8").splitlines():
+                try:
+                    event = json.loads(line)
+                except ValueError:
+                    continue
+                if not isinstance(event, dict) or not isinstance(event.get("source"), str):
+                    continue
+                entries.append(event)
+        excluded = {name.casefold() for name in yaml.safe_load(POLICY.read_text(encoding="utf-8")).get("exclude_files", [])}
+        for entry in entries:
+            entry["stage"] = entry.get("stage") or "indexing"
+            entry["error_type"] = "No extractable text"
+            entry["message"] = entry.get("reason") or "Scanned PDF or image-only file; OCR is required."
+            try:
+                relative_path(entry["source"])
+                entry["can_ignore"] = True
+            except (KeyError, ValueError):
+                entry["can_ignore"] = False
+            entry["ignored"] = entry["source"].casefold() in excluded
+            entry["auto_excluded"] = False
+        return entries
+
+    def index_issues(self):
+        errors, origin = self.index_errors()
+        skipped = self.index_skipped()
+        genuine = []
+        for entry in errors:
+            label = f"{entry.get('error_type', '')} {entry.get('message', '')}"
+            if "No extractable text" in label or "EmptyDocumentError" in label:
+                skipped.append(
+                    {
+                        "at": entry.get("at"),
+                        "stage": entry.get("stage") or "indexing",
+                        "source": entry["source"],
+                        "reason": "No extractable text; scanned or image-only document",
+                        "error_type": "No extractable text",
+                        "message": "Scanned PDF or image-only file; OCR is required.",
+                        "can_ignore": entry.get("can_ignore", False),
+                        "ignored": entry.get("ignored", False),
+                        "auto_excluded": entry.get("auto_excluded", False),
+                    }
+                )
+            else:
+                genuine.append(entry)
+        return genuine, skipped, origin
 
     def _readiness(self, status):
         """Describe, in plain language, what the deployment is doing right now."""
@@ -1255,7 +1321,7 @@ class Controller:
                     output.seek(0, 2)
                     output.seek(max(0, output.tell() - 12000))
                     tail = output.read().decode("utf-8", errors="replace")
-            index_errors, error_origin = self.index_errors()
+            index_errors, index_skipped, error_origin = self.index_issues()
             result = {
                 "config": dict(self.config),
                 "version": APP_VERSION,
@@ -1296,6 +1362,9 @@ class Controller:
                 "index_progress": index_progress,
                 "index_errors": index_errors[:25],
                 "index_error_count": len(index_errors),
+                "index_skipped": index_skipped[:25],
+                "index_skipped_count": len(index_skipped),
+                "index_summary": self._index_summary(),
                 "index_error_origin": error_origin,
                 "index_log_available": log.is_file(),
                 "index_stages_available": (DATA / "index-stages.log").is_file(),
@@ -1449,8 +1518,8 @@ class Handler(BaseHTTPRequestHandler):
         elif self.path == "/api/status":
             self.send(200, json.dumps(controller.status()))
         elif self.path == "/api/index/errors":
-            entries, origin = controller.index_errors()
-            self.send(200, json.dumps({"errors": entries, "origin": origin}))
+            errors, skipped, origin = controller.index_issues()
+            self.send(200, json.dumps({"errors": errors, "skipped": skipped, "origin": origin}))
         elif self.path == "/api/index/log/full":
             self.send_download(DATA / "ingest.log", "indexing-full.log")
         elif self.path == "/api/index/log/stages":

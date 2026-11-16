@@ -2,6 +2,7 @@
 
 import contextlib
 import io
+import json
 import os
 import sys
 import tempfile
@@ -50,6 +51,8 @@ class RetrievalHardeningTest(unittest.TestCase):
             patch.object(ingest, "STATE_FILE", self.base / "state.json"),
             patch.object(ingest, "ERROR_LOG", self.base / "errors.log"),
             patch.object(ingest, "RUN_ERRORS_FILE", None),
+            patch.object(ingest, "SKIPPED_FILE", self.base / "skipped.jsonl"),
+            patch.object(ingest, "SUMMARY_FILE", self.base / "summary.json"),
             patch.object(ingest, "STAGES_FILE", None),
             patch.object(ingest, "PROGRESS_FILE", None),
             patch.object(retrieval, "client", self.client),
@@ -159,6 +162,38 @@ class RetrievalHardeningTest(unittest.TestCase):
         self.assertEqual(result["backend"], "unavailable")
         self.assertEqual(result["reason"], "RuntimeError")
         self.assertEqual(result["results"], [])
+
+    def test_scanned_pdfs_are_skipped_once_and_never_reparsed(self):
+        from pypdf import PdfWriter
+
+        writer = PdfWriter()
+        writer.add_blank_page(width=200, height=200)
+        with (self.root / "scanned.pdf").open("wb") as output:
+            writer.write(output)
+        self.write("good.md", "Qdrant telescope configuration notes.")
+
+        with patch.object(ingest, "parse_pdf", wraps=ingest.parse_pdf) as parse:
+            self.run_index()
+        self.assertEqual(parse.call_count, 1)
+        state = ingest.load_state()["documents"]
+        self.assertEqual(sum(1 for entry in state.values() if entry.get("empty")), 1)
+        self.assertFalse(any(entry.get("pending") for entry in state.values()))
+        self.assertEqual(
+            len((self.base / "skipped.jsonl").read_text(encoding="utf-8").splitlines()),
+            1,
+        )
+        summary = json.loads((self.base / "summary.json").read_text(encoding="utf-8"))
+        self.assertEqual(summary["skipped"], 1)
+        self.assertEqual(summary["failed"], 0)
+        self.assertEqual(summary["indexed"], 1)
+
+        with patch.object(ingest, "parse_pdf", wraps=ingest.parse_pdf) as reparsed:
+            self.run_index()
+        self.assertEqual(reparsed.call_count, 0)
+        self.assertEqual(
+            [r["source"] for r in retrieval.search("telescope")["results"]],
+            ["good.md"],
+        )
 
     def test_ingest_and_retrieval_read_the_saved_policy_identically(self):
         custom = self.policy()

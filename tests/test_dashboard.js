@@ -58,6 +58,7 @@ function dashboard(config, connected = false, pathname = '/dashboard/indexing') 
       else if (route === '/api/policy') result = body ? {saved: true} : {policy: {exclude_files: []}, content: 'exclude_files: []'};
       else if (route === '/api/folder/check') result = {reachable: true, mode: 'host_agent'};
       else if (route === '/api/scan/files') result = {files: ['notes/first.md', 'notes/second.md', 'notes/third.md']};
+      else if (route === '/api/index/errors') result = {errors: status.index_errors || [], skipped: status.index_skipped || [], origin: status.index_error_origin || 'current'};
       else if (route === '/api/agent/refresh') result = {sync_request: 1};
       else if (route === '/api/scan') result = {requested: true};
       else if (route === '/api/onboarding/progress') result = {setup_step: body.step};
@@ -577,6 +578,42 @@ test('connection settings expose the MCP endpoint, version and update command', 
   assert.equal(elements['mcp-endpoint'].value, 'http://HOST_IP:8100/mcp');
   assert.equal(elements['app-version'].textContent, '2.2.0');
   assert.match(elements['update-command'].value, /self-update\.sh/);
+});
+
+test('indexing details open in a separate dialog with errors and skipped documents', async () => {
+  const {elements, context, status} = dashboard({...legacy, onboarding_complete: true, setup_step: 7});
+  status.index_error_count = 1;
+  status.index_errors = [{source: 'notes/bad.docx', stage: 'indexing', error_type: 'ValueError', message: 'Cannot parse', can_ignore: true, ignored: false}];
+  status.index_skipped_count = 2;
+  status.index_skipped = [
+    {source: 'scans/a.pdf', stage: 'indexing', error_type: 'No extractable text', message: 'Scanned PDF', can_ignore: true, ignored: false},
+    {source: 'scans/b.pdf', stage: 'indexing', error_type: 'No extractable text', message: 'Scanned PDF', can_ignore: true, ignored: false}
+  ];
+  await vm.runInContext('refresh()', context);
+  assert.equal(elements['index-errors-card'].classList.contains('hidden'), false);
+  assert.match(elements['index-errors-summary'].textContent, /2 documents were skipped/);
+  assert.match(elements['index-errors-summary'].textContent, /1 document has errors/);
+  assert.match(elements['index-errors-all'].textContent, /View details/);
+  assert.equal(elements['index-errors-list'].children.length, 1);
+  assert.equal(elements['index-skipped-list'].children.length, 2);
+  await vm.runInContext('openIndexErrors()', context);
+  assert.equal(elements['index-errors-dialog'].open, true);
+  assert.equal(elements['index-errors-count'].textContent, '1');
+  assert.equal(elements['index-skipped-count'].textContent, '2');
+  assert.equal(elements['index-errors-empty'].classList.contains('hidden'), true);
+  assert.equal(elements['index-skipped-empty'].classList.contains('hidden'), true);
+  assert.equal(elements['index-ignore-all-skipped'].classList.contains('hidden'), false);
+});
+
+test('all skipped documents can be excluded in one action', async () => {
+  const {context, status, calls} = dashboard({...legacy, onboarding_complete: true, setup_step: 7});
+  status.index_skipped_count = 2;
+  status.index_skipped = [{source: 'scans/a.pdf'}, {source: 'scans/b.pdf'}];
+  context.confirm = () => true;
+  await vm.runInContext('loadPolicy = async () => {}; ignoreAllSkipped()', context);
+  const writes = calls.filter(x => x.route === '/api/policy' && x.body && x.body.policy);
+  assert.equal(writes.length, 1);
+  assert.deepEqual(writes[0].body.policy.exclude_files, ['scans/a.pdf', 'scans/b.pdf']);
 });
 
 test('a global busy indicator reflects in-flight actions', async () => {

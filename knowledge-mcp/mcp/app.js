@@ -292,26 +292,55 @@ async function ignoreIndexError(source) {
     message('File excluded. Wait for the folder to sync, then run the incremental update.');
   } catch (e) { message(e.message, true); }
 }
+function fillIssueList(id, items, running) {
+  const list = $(id); list.replaceChildren();
+  for (const item of items || []) appendIndexError(list, item, running);
+}
 async function openIndexErrors() {
   try {
-    const result = await api('/api/index/errors'), list = $('index-errors-all-list');
-    list.replaceChildren();
-    for (const error of result.errors) appendIndexError(list, error, current?.index_running);
+    const result = await api('/api/index/errors');
+    const errors = result.errors || [], skipped = result.skipped || [];
+    fillIssueList('index-errors-list', errors, current?.index_running);
+    fillIssueList('index-skipped-list', skipped, current?.index_running);
+    $('index-errors-count').textContent = String(errors.length);
+    $('index-skipped-count').textContent = String(skipped.length);
+    $('index-errors-empty').classList.toggle('hidden', errors.length > 0);
+    $('index-skipped-empty').classList.toggle('hidden', skipped.length > 0);
+    $('index-ignore-all-skipped').classList.toggle('hidden', skipped.length === 0);
     $('index-errors-dialog').showModal();
   } catch (e) { message(e.message, true); }
 }
+async function ignoreAllSkipped() {
+  try {
+    const result = await api('/api/index/errors');
+    const sources = [...new Set((result.skipped || []).map(x => x.source).filter(Boolean))];
+    if (!sources.length) { message('No skipped documents to ignore.'); return; }
+    if (!confirm(`Exclude ${sources.length} skipped ${sources.length === 1 ? 'document' : 'documents'} from future indexing runs?`)) return;
+    const saved = await api('/api/policy'), next = saved.policy;
+    next.exclude_files = [...new Set([...(next.exclude_files || []), ...sources])];
+    await api('/api/policy', {policy: next});
+    await loadPolicy(); await refresh();
+    $('index-errors-dialog').close();
+    message(`${sources.length} documents excluded. Run the incremental update to apply it.`);
+  } catch (e) { message(e.message, true); }
+}
 function renderIndexErrors(s) {
-  const count = s.index_error_count || 0;
+  const count = s.index_error_count || 0, skipped = s.index_skipped_count || 0;
   const failed = !s.index_running && s.last_result && !s.last_result.dry_run && s.last_result.exit_code !== 0;
-  $('index-errors-card').classList.toggle('hidden', !count && !failed);
-  if (count) {
-    const historical = s.index_error_origin === 'legacy' ? ' These entries come from an older error log and may include earlier attempts.' : '';
-    $('index-errors-summary').textContent = `${count} ${count === 1 ? 'document has' : 'documents have'} errors. Successfully indexed documents remain saved.${historical}`;
-  } else if (failed) $('index-errors-summary').textContent = 'Indexing stopped before a document error was recorded. Download the full log for details.';
-  else $('index-errors-summary').textContent = '';
-  const list = $('index-errors-list'); list.replaceChildren();
-  for (const error of s.index_errors || []) appendIndexError(list, error, s.index_running);
-  $('index-errors-all').classList.toggle('hidden', count <= (s.index_errors || []).length);
+  $('index-errors-card').classList.toggle('hidden', !count && !skipped && !failed);
+  const parts = [];
+  if (count) parts.push(`${count} ${count === 1 ? 'document has' : 'documents have'} errors.`);
+  if (skipped) parts.push(`${skipped} ${skipped === 1 ? 'document was' : 'documents were'} skipped because no text could be extracted (scanned PDFs or image-only files).`);
+  if (!count && !skipped && failed) parts.push('Indexing stopped before a document error was recorded. Download the full log for details.');
+  const historical = count && s.index_error_origin === 'legacy' ? ' These entries come from an older error log and may include earlier attempts.' : '';
+  $('index-errors-summary').textContent = parts.length ? parts.join(' ') + ' Successfully indexed documents remain saved.' + historical : '';
+  if (!$('index-errors-dialog').open) {
+    fillIssueList('index-errors-list', s.index_errors, s.index_running);
+    fillIssueList('index-skipped-list', s.index_skipped, s.index_running);
+  }
+  const details = count + skipped + (failed ? 1 : 0);
+  $('index-errors-all').classList.toggle('hidden', !details);
+  if (details) $('index-errors-all').textContent = `View details (${count} errors, ${skipped} skipped)`;
   for (const id of ['download-index-full', 'setup-download-full']) $(id).classList.toggle('hidden', !s.index_log_available);
   for (const id of ['download-index-stages', 'setup-download-stages']) $(id).classList.toggle('hidden', !s.index_stages_available);
   $('index-stages-note').classList.toggle('hidden', !s.index_log_available || s.index_stages_available);

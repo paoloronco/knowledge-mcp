@@ -137,7 +137,7 @@ class AdminBoundaryTest(unittest.TestCase):
                 self.assertEqual(origin, "current")
                 self.assertEqual([item["source"] for item in errors], ["notes/bad.pdf"])
 
-                fake = types.SimpleNamespace(password_enabled=lambda: True, sessions={}, lock=threading.RLock(), index_errors=lambda: (errors, origin))
+                fake = types.SimpleNamespace(password_enabled=lambda: True, sessions={}, lock=threading.RLock(), index_errors=lambda: (errors, origin), index_issues=lambda: (errors, [], origin))
                 with patch.object(app, "controller", fake):
                     server = ThreadingHTTPServer(("127.0.0.1", 0), app.Handler)
                     thread = threading.Thread(target=server.serve_forever, daemon=True)

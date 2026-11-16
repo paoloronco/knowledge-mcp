@@ -70,8 +70,22 @@ RUN_ERRORS_FILE = (
     if os.getenv("INGEST_RUN_ERRORS_FILE")
     else None
 )
+SKIPPED_FILE = (
+    Path(os.environ["INGEST_SKIPPED_FILE"])
+    if os.getenv("INGEST_SKIPPED_FILE")
+    else None
+)
+SUMMARY_FILE = (
+    Path(os.environ["INGEST_SUMMARY_FILE"])
+    if os.getenv("INGEST_SUMMARY_FILE")
+    else None
+)
 _progress_last_write = 0
 _progress_last_stage = None
+
+
+class EmptyDocumentError(ValueError):
+    """A readable file with no extractable text (scanned PDF, image-only slide)."""
 
 
 def write_progress(stage, completed=0, total=None, force=False):
@@ -232,6 +246,32 @@ def log_error(path, error, stage="indexing"):
         }
         with RUN_ERRORS_FILE.open("a", encoding="utf-8") as output:
             output.write(json.dumps(event, ensure_ascii=False) + "\n")
+
+
+def log_skipped(path, reason, stage="indexing"):
+    if SKIPPED_FILE is None:
+        return
+    root = Path(os.getenv("KNOWLEDGE_ROOT", "")).resolve()
+    try:
+        source = path.resolve().relative_to(root).as_posix()
+    except ValueError:
+        source = path.name
+    event = {
+        "at": datetime.now(timezone.utc).isoformat(),
+        "stage": stage,
+        "source": source,
+        "reason": str(reason)[:300],
+    }
+    with SKIPPED_FILE.open("a", encoding="utf-8") as output:
+        output.write(json.dumps(event, ensure_ascii=False) + "\n")
+
+
+def write_summary(values):
+    if SUMMARY_FILE is None:
+        return
+    temp = SUMMARY_FILE.with_suffix(".tmp")
+    temp.write_text(json.dumps(values), encoding="utf-8")
+    temp.replace(SUMMARY_FILE)
 
 
 def sha256_file(path):
@@ -722,7 +762,7 @@ def document_records(path, model=None):
                 )
                 chunk_index += 1
     if not records:
-        raise ValueError(
+        raise EmptyDocumentError(
             "No extractable text; scanned PDFs require OCR before indexing"
         )
     return records
@@ -794,16 +834,19 @@ def run_ingestion(args):
         documents = documents[: args.limit]
     print(f"Unique documents: {len(documents)}", flush=True)
     if args.dry_run:
-        failures, chunks = hash_failures, 0
+        failures, skipped, chunks = hash_failures, 0, 0
         for count, (_, paths) in enumerate(tqdm(documents), 1):
             try:
                 chunks += len(document_records(paths[0]))
+            except EmptyDocumentError as exc:
+                skipped += 1
+                log_skipped(paths[0], str(exc), "dry_run")
             except Exception as exc:
                 failures += 1
                 log_error(paths[0], exc, "dry_run")
             write_progress("dry_run", count, len(documents))
         print(
-            f"Documents parsed: {len(documents) - failures}\nFailed: {failures}\nChunks produced: {chunks}",
+            f"Documents parsed: {len(documents) - failures - skipped}\nSkipped (no text): {skipped}\nFailed: {failures}\nChunks produced: {chunks}",
             flush=True,
         )
         write_progress(
@@ -811,6 +854,17 @@ def run_ingestion(args):
             len(documents),
             len(documents),
             force=True,
+        )
+        write_summary(
+            {
+                "dry_run": True,
+                "indexed": 0,
+                "already_indexed": 0,
+                "skipped": skipped,
+                "failed": failures,
+                "chunks": chunks,
+                "finished_at": time.time(),
+            }
         )
         if failures or not documents:
             raise SystemExit(1)
@@ -859,7 +913,7 @@ def run_ingestion(args):
         else get_model().get_sentence_embedding_dimension()
     )
     created = ensure_collection(client, dimension, rebuild=args.rebuild)
-    if created or client.count(COLLECTION_NAME, exact=True).count == 0:
+    if created or client.count(COLLECTION_NAME, exact=False).count == 0:
         state["documents"] = {}
         state.pop("reconcile_required", None)
         save_state(state)
@@ -869,7 +923,9 @@ def run_ingestion(args):
         ).encode()
     ).hexdigest()
     indexed, skipped, failed, indexed_chunks = 0, 0, 0, 0
+    empty_skipped = 0
     failed_sources = set()
+    empty_sources = set()
 
     try:
         for count, (document_id, paths) in enumerate(tqdm(documents), 1):
@@ -880,6 +936,9 @@ def run_ingestion(args):
             previous = state["documents"].get(document_id, {})
             if previous.get("signature") == signature and not previous.get("pending"):
                 if previous.get("source") == source:
+                    if previous.get("empty"):
+                        empty_sources.add(source)
+                        empty_sources.update(duplicates)
                     if previous.get("duplicate_sources") != duplicates:
                         client.set_payload(
                             COLLECTION_NAME,
@@ -1047,6 +1106,23 @@ def run_ingestion(args):
                 )
                 indexed += 1
                 indexed_chunks += len(records)
+            except EmptyDocumentError as exc:
+                empty_skipped += 1
+                empty_sources.add(source)
+                empty_sources.update(duplicates)
+                log_skipped(primary, str(exc))
+                record_state(
+                    state,
+                    document_id,
+                    {
+                        "source": source,
+                        "duplicate_sources": duplicates,
+                        "chunks": 0,
+                        "signature": signature,
+                        "empty": True,
+                        "indexed_at": datetime.now(timezone.utc).isoformat(),
+                    },
+                )
             except Exception as exc:
                 failed += 1
                 failed_sources.update(
@@ -1057,7 +1133,7 @@ def run_ingestion(args):
         # new document_id, so removing the old version up front would discard the
         # last usable copy when the replacement fails to parse.
         if args.limit is None:
-            protected_sources = failed_sources | hash_failure_sources
+            protected_sources = failed_sources | hash_failure_sources | empty_sources
             for document_id in set(state["documents"]) - set(hash_to_paths):
                 entry = state["documents"][document_id]
                 entry_sources = {
@@ -1086,7 +1162,7 @@ def run_ingestion(args):
     finally:
         save_state(state)
     print(
-        f"Indexed documents: {indexed}\nAlready indexed: {skipped}\nFailed: {failed + hash_failures}\nChunks indexed: {indexed_chunks}\nElapsed: {(time.time() - start_time):.1f}s",
+        f"Indexed documents: {indexed}\nAlready indexed: {skipped}\nSkipped (no text): {empty_skipped}\nFailed: {failed + hash_failures}\nChunks indexed: {indexed_chunks}\nElapsed: {(time.time() - start_time):.1f}s",
         flush=True,
     )
     write_progress(
@@ -1094,6 +1170,17 @@ def run_ingestion(args):
         len(documents),
         len(documents),
         force=True,
+    )
+    write_summary(
+        {
+            "dry_run": False,
+            "indexed": indexed,
+            "already_indexed": skipped,
+            "skipped": empty_skipped,
+            "failed": failed + hash_failures,
+            "chunks": indexed_chunks,
+            "finished_at": time.time(),
+        }
     )
     if failed or hash_failures:
         raise SystemExit(1)
