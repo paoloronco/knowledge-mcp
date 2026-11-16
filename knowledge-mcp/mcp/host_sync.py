@@ -40,6 +40,34 @@ def host_root(value):
     return normalized
 
 
+def root_allowed(value, allow_roots):
+    """True when an absolute host/document root is inside the configured ACL allowlist.
+
+    An empty allowlist means "no restriction" for backward compatibility. Both the
+    candidate and the allowlist entries are normalized with ``host_root`` so a
+    folder may only be selected under an explicitly permitted root.
+    """
+    if not allow_roots:
+        return True
+    try:
+        candidate = host_root(value)
+    except ValueError:
+        return False
+    for allowed in allow_roots:
+        if not isinstance(allowed, str):
+            continue
+        try:
+            base = host_root(allowed)
+        except ValueError:
+            continue
+        module = ntpath if ("\\" in candidate or ":" in candidate) else posixpath
+        sep = "\\" if module is ntpath else "/"
+        normalize = str.casefold if module is ntpath else str
+        if normalize(candidate) == normalize(base) or normalize(candidate).startswith(normalize(base.rstrip("\\/") + sep)):
+            return True
+    return False
+
+
 def relative_path(value):
     if not isinstance(value, str) or not value or len(value) > 4096 or any(c in value for c in "\\\x00\r\n:"):
         raise ValueError("Invalid document path")
@@ -65,7 +93,8 @@ def allowed_file(value, size, policy):
     directories = {part.casefold() for part in parts[:-1]}
     excluded_top = {x.casefold() for x in (policy.get("exclude_top_level") or [])}
     excluded_dirs = {x.casefold() for x in (policy.get("exclude_directories") or [])}
-    if directories.intersection(excluded_top | excluded_dirs):
+    acl_deny = {x.casefold() for x in (policy.get("acl_deny_directories") or [])}
+    if directories.intersection(excluded_top | excluded_dirs | acl_deny):
         return False
     excluded = {x.casefold() for x in (policy.get("exclude_files") or [])}
     if path.name.casefold() in excluded or value.casefold() in excluded:

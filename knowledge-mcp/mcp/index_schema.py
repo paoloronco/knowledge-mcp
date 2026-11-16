@@ -1,6 +1,7 @@
 """Shared, versioned payload and lexical representation for indexing and search."""
 
 import hashlib
+import os
 import re
 from collections import Counter
 from pathlib import PurePosixPath
@@ -28,8 +29,18 @@ def tokens(text):
     return result
 
 
+def _lexical_bigrams_enabled():
+    return os.getenv("LEXICAL_BIGRAMS", "").strip().lower() in {"1", "true", "yes", "on"}
+
+
 def sparse_vector(text, source="", section="", query=False):
-    counts = Counter(tokens(text))
+    terms = tokens(text)
+    counts = Counter(terms)
+    # Opt-in phrase signal. Qdrant sparse indices are uint32, so term IDs stay
+    # 32-bit; bigrams improve phrase matching without widening the hash space.
+    if _lexical_bigrams_enabled():
+        for left, right in zip(terms, terms[1:]):
+            counts[f"{left}::{right}"] += 1
     length = max(1, sum(counts.values()))
     if not query:
         counts.update(
@@ -66,9 +77,11 @@ def source_metadata(source, duplicate_sources=()):
             PurePosixPath(*parts[:end]).as_posix() for end in range(1, len(parts))
         )
     paths = [source, *duplicate_sources]
+    parent = path.parent.as_posix() if len(path.parts) > 1 else ""
     return {
         "index_version": INDEX_VERSION,
         "directories": directories,
+        "parent_dir": parent,
         "source_top_level": path.parts[0].casefold(),
         "source_prefixes": sorted(prefixes),
         "source_paths": paths,
@@ -103,6 +116,10 @@ def ensure_search_schema(client, collection):
         "source_prefixes_casefold": models.PayloadSchemaType.KEYWORD,
         "source_paths_casefold": models.PayloadSchemaType.KEYWORD,
         "source_top_level": models.PayloadSchemaType.KEYWORD,
+        "parent_dir": models.PayloadSchemaType.KEYWORD,
+        "section_path": models.PayloadSchemaType.KEYWORD,
+        "title": models.PayloadSchemaType.KEYWORD,
+        "language": models.PayloadSchemaType.KEYWORD,
         "directories": models.PayloadSchemaType.KEYWORD,
         "lifecycle": models.PayloadSchemaType.KEYWORD,
         "index_version": models.PayloadSchemaType.INTEGER,

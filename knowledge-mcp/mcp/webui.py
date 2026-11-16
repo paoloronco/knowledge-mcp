@@ -24,7 +24,7 @@ from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
 
 import yaml
-from host_sync import allowed_file, host_root, is_office_lock_file, relative_path, cached_file_hash
+from host_sync import allowed_file, host_root, is_office_lock_file, relative_path, cached_file_hash, root_allowed
 from embedding_models import DEFAULT_MODEL, MODELS
 from gpu_probe import GPU_MONITOR
 from policy_defaults import (
@@ -46,6 +46,7 @@ SOURCE = Path(os.getenv("KNOWLEDGE_ROOT", str(MANAGED_SOURCE))).resolve()
 CONFIG = DATA / "config.json"
 AUTH = DATA / "auth.json"
 AGENT_AUTH = DATA / "agent-auth.json"
+MCP_AUTH = DATA / "mcp-auth.json"
 AGENT_MANIFEST = DATA / "agent-manifest.json"
 AUTO_AGENT_CONFIG = Path(os.environ["AUTO_HOST_AGENT_CONFIG"]) if os.getenv("AUTO_HOST_AGENT_CONFIG") else None
 POLICY = DATA / "index-policy.yaml"
@@ -53,6 +54,11 @@ DEFAULT_POLICY = ROOT / "mcp" / "index-policy.yaml"
 HTML = Path(__file__).with_name("webui.html")
 SCRIPT = Path(__file__).with_name("app.js")
 CONTROL_TOKEN = secrets.token_urlsafe(32)
+# Newer settings are optional when restoring a backup created by an older
+# release; their defaults are applied by Controller.__init__ instead.
+OPTIONAL_BACKUP_KEYS = frozenset(
+    {"mcp_auth_enabled", "acl_allow_roots", "acl_deny_directories", "lexical_bigrams"}
+)
 
 
 def _token_matches(provided: str) -> bool:
@@ -67,7 +73,7 @@ SETUP_PATHS = ("/setup/login", "/setup/health", "/setup/folders", "/setup/policy
 DASHBOARD_PATHS = ("/dashboard", "/dashboard/indexing", "/dashboard/indexing/model", "/dashboard/folders", "/dashboard/policy", "/dashboard/settings")
 
 
-def validate_source_root(value):
+def validate_source_root(value, allow_roots=None):
     if not isinstance(value, str) or not value or (os.name != "nt" and "\\" in value):
         raise ValueError("Enter an absolute document path inside the container")
     path = Path(value)
@@ -84,6 +90,8 @@ def validate_source_root(value):
     restricted = REQUIRED_DIRECTORY_NAMES | REQUIRED_TOP_LEVEL_NAMES
     if any(part.casefold() in restricted for part in path.parts):
         raise ValueError("This path is excluded by the indexing policy")
+    if not root_allowed(str(path), allow_roots):
+        raise ValueError("This document root is not in the allowed-roots list")
     return path
 
 
@@ -147,6 +155,28 @@ def password_record(password):
     return {"salt": salt.hex(), "hash": digest.hex()}
 
 
+def read_policy(config=None):
+    """Load the indexing policy and overlay the Settings ACL.
+
+    Ingestion, retrieval and the host agent are separate processes, so the ACL
+    stored in ``config.json`` is attached to the policy each time it is read and
+    passed to the other components (agent task / sync signature / env).
+    """
+    policy = yaml.safe_load(POLICY.read_text(encoding="utf-8"))
+    if config is None:
+        try:
+            config = controller.config if controller else {}
+        except Exception:
+            config = {}
+    try:
+        policy["acl_deny_directories"] = list(config.get("acl_deny_directories") or [])
+        policy["acl_allow_roots"] = list(config.get("acl_allow_roots") or [])
+    except Exception:
+        policy["acl_deny_directories"] = []
+        policy["acl_allow_roots"] = []
+    return policy
+
+
 def validate_policy(content):
     policy = yaml.safe_load(content)
     default = yaml.safe_load(DEFAULT_POLICY.read_text(encoding="utf-8"))
@@ -187,7 +217,7 @@ class Controller:
         self.lock = threading.RLock()
         first_start = not CONFIG.exists()
         environment_model = next((key for key, spec in MODELS.items() if spec["model"] == os.getenv("MODEL_NAME", MODELS[DEFAULT_MODEL]["model"]) and spec["collection"] == os.getenv("DENSE_COLLECTION", "documents")), "environment")
-        self.config = {"source_selection": "auto", "source_mode": "host_agent" if first_start else "container", "host_root": "", "sync_revision": 0, "sync_request": 0, "scan_requested_revision": -1, "source_root": str(HOST_SOURCE if first_start else SOURCE), "folders": [""], "interval_hours": 0, "mcp_enabled": False, "qdrant_enabled": True, "last_run_at": 0, "onboarding_complete": not first_start, "initial_index_skipped": False, "setup_step": 0 if first_start else 7, "setup_flow_version": 2, "embedding_model": environment_model, "active_embedding_model": None, "legacy_embedding_model": environment_model}
+        self.config = {"source_selection": "auto", "source_mode": "host_agent" if first_start else "container", "host_root": "", "sync_revision": 0, "sync_request": 0, "scan_requested_revision": -1, "source_root": str(HOST_SOURCE if first_start else SOURCE), "folders": [""], "interval_hours": 0, "mcp_enabled": False, "qdrant_enabled": True, "last_run_at": 0, "onboarding_complete": not first_start, "initial_index_skipped": False, "setup_step": 0 if first_start else 7, "setup_flow_version": 2, "embedding_model": environment_model, "active_embedding_model": None, "legacy_embedding_model": environment_model, "mcp_auth_enabled": False, "acl_allow_roots": [], "acl_deny_directories": [], "lexical_bigrams": False}
         migrated = False
         if CONFIG.exists():
             stored = json.loads(CONFIG.read_text(encoding="utf-8"))
@@ -244,6 +274,9 @@ class Controller:
         self.backup_download = None
         self.qdrant = None
         self.mcp = None
+        self.mcp_restarts = 0
+        self.mcp_restart_not_before = 0.0
+        self.mcp_error_text = ""
         self.ingest = None
         self.ingest_dry_run = False
         self.ingest_rebuild = False
@@ -305,6 +338,8 @@ class Controller:
         if not isinstance(restored, dict):
             raise ValueError("Backup settings must be an object")
         for key, value in self.config.items():
+            if key in OPTIONAL_BACKUP_KEYS and key not in restored:
+                continue
             actual = restored.get(key)
             if key == "active_embedding_model":
                 valid = actual is None or isinstance(actual, str)
@@ -321,6 +356,17 @@ class Controller:
             raise ValueError("Invalid source or schedule in backup")
         if not isinstance(restored["folders"], list) or len(restored["folders"]) > 32 or not all(isinstance(folder, str) and (folder == "" or relative_path(folder)) for folder in restored["folders"]):
             raise ValueError("Invalid folders in backup")
+        for key in ("acl_allow_roots", "acl_deny_directories"):
+            if key in restored and (
+                not isinstance(restored[key], list)
+                or len(restored[key]) > 128
+                or any(not isinstance(x, str) or len(x) > 4096 for x in restored[key])
+            ):
+                raise ValueError(f"Invalid {key} in backup")
+        if "mcp_auth_enabled" in restored and type(restored["mcp_auth_enabled"]) is not bool:
+            raise ValueError("Invalid mcp_auth_enabled in backup")
+        if "lexical_bigrams" in restored and type(restored["lexical_bigrams"]) is not bool:
+            raise ValueError("Invalid lexical_bigrams in backup")
         if any(type(restored[key]) is not int for key in ("sync_revision", "sync_request", "scan_requested_revision", "setup_step", "setup_flow_version")) or not 0 <= restored["setup_step"] <= 7 or restored["setup_flow_version"] != 2 or restored["last_run_at"] < 0:
             raise ValueError("Invalid indexing state in backup")
         validate_policy((data / "index-policy.yaml").read_text(encoding="utf-8"))
@@ -463,7 +509,27 @@ class Controller:
             if indexing and chosen != self.config["legacy_embedding_model"]:
                 base = Path(os.getenv("INGESTION_BASE_DIR", str(ROOT / ".state")))
                 env["INGESTION_BASE_DIR"] = str(base / "models" / chosen)
+        auth_enabled = bool(self.config.get("mcp_auth_enabled"))
+        env["MCP_AUTH_ENABLED"] = "1" if auth_enabled else "0"
+        if auth_enabled:
+            token = self.mcp_auth_token()
+            if token:
+                env["MCP_AUTH_TOKEN"] = token
+        env["ACL_DENY_DIRECTORIES"] = ",".join(self.config.get("acl_deny_directories") or [])
+        env["LEXICAL_BIGRAMS"] = "1" if self.config.get("lexical_bigrams") else "0"
+        env["MCP_PRELOAD_MODEL"] = "1"
         return env
+
+    def mcp_auth_token(self):
+        """Return the stored MCP access token, or None. It lives in a dedicated
+        file rather than config.json so it is never served as part of the
+        public config object."""
+        try:
+            record = json.loads(MCP_AUTH.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return None
+        token = record.get("token")
+        return token if isinstance(token, str) and token else None
 
     def select_embedding_model(self, model_id):
         if model_id not in MODELS:
@@ -528,15 +594,17 @@ class Controller:
     def agent_task(self):
         with self.lock:
             self.agent_seen_at = time.time()
-            return {"source_mode": self.config["source_mode"], "host_root": self.config["host_root"], "folders": self.config["folders"], "revision": self.config["sync_revision"], "sync_request": self.config["sync_request"], "index_running": bool(self.ingest and self.ingest.poll() is None), "scan_enabled": self.config["onboarding_complete"] or self.config["scan_requested_revision"] == self.config["sync_revision"], "folder_probe": self.folder_probe, "policy": yaml.safe_load(POLICY.read_text(encoding="utf-8"))}
+            return {"source_mode": self.config["source_mode"], "host_root": self.config["host_root"], "folders": self.config["folders"], "revision": self.config["sync_revision"], "sync_request": self.config["sync_request"], "index_running": bool(self.ingest and self.ingest.poll() is None), "scan_enabled": self.config["onboarding_complete"] or self.config["scan_requested_revision"] == self.config["sync_revision"], "folder_probe": {**self.folder_probe, "acl_allow_roots": self.config["acl_allow_roots"]} if self.folder_probe else None, "policy": read_policy()}
 
     def check_folder(self, path, selection):
         if selection not in ("auto", "host_agent", "container"):
             raise ValueError("Invalid document location")
         candidate = host_root(path)
+        if not root_allowed(candidate, self.config.get("acl_allow_roots")):
+            raise ValueError("This folder is not in the allowed-roots list")
         mode = ("host_agent" if AUTO_AGENT_CONFIG is not None or not Path(candidate).is_dir() else "container") if selection == "auto" else selection
         if mode == "container":
-            validate_source_root(candidate)
+            validate_source_root(candidate, self.config.get("acl_allow_roots"))
             return {"reachable": True, "mode": mode}
         with self.probe_condition:
             if time.time() - self.agent_seen_at >= 60:
@@ -590,7 +658,7 @@ class Controller:
                 return {"requested": True}
             root = validate_source_root(self.config["source_root"])
             folders = normalize_folders(self.config["folders"], root)
-            policy = yaml.safe_load(POLICY.read_text(encoding="utf-8"))
+            policy = read_policy()
             revision = self.config["sync_revision"]
             self.local_scan = {"revision": revision, "running": True, "checked": 0, "eligible": 0, "files": [], "error": ""}
             threading.Thread(target=self._scan_local, args=(root, folders, policy, revision), daemon=True).start()
@@ -690,7 +758,7 @@ class Controller:
                 raise ValueError("Invalid host sync request")
             if self.ingest and self.ingest.poll() is None:
                 raise ValueError("Wait until indexing finishes before syncing")
-            policy = yaml.safe_load(POLICY.read_text(encoding="utf-8"))
+            policy = read_policy()
             for name, item in files.items():
                 if not isinstance(item, dict) or not selected_file(name, self.config["folders"]) or not allowed_file(name, item.get("size"), policy) or not isinstance(item.get("sha256"), str) or len(item["sha256"]) != 64 or any(c not in "0123456789abcdef" for c in item["sha256"]):
                     raise ValueError("Invalid or excluded document in inventory")
@@ -704,7 +772,7 @@ class Controller:
         with self.lock:
             if self.stopping or self.maintenance:
                 raise ValueError("No active host sync")
-            policy = yaml.safe_load(POLICY.read_text(encoding="utf-8"))
+            policy = read_policy()
             if self.config["source_mode"] != "host_agent" or revision != self.config["sync_revision"] or not self.sync_in_progress:
                 raise ValueError("No active host sync")
             if not selected_file(name, self.config["folders"]) or not allowed_file(name, size, policy) or not isinstance(digest, str) or len(digest) != 64 or any(c not in "0123456789abcdef" for c in digest):
@@ -729,7 +797,7 @@ class Controller:
             if actual.hexdigest() != digest:
                 raise ValueError("Document checksum mismatch")
             with self.lock:
-                policy = yaml.safe_load(POLICY.read_text(encoding="utf-8"))
+                policy = read_policy()
                 if (
                     self.stopping
                     or self.maintenance
@@ -760,7 +828,7 @@ class Controller:
                 raise ValueError("No active host sync")
             if type(request_id) is not int or not 0 <= request_id <= self.config["sync_request"]:
                 raise ValueError("Invalid host sync request")
-            policy = yaml.safe_load(POLICY.read_text(encoding="utf-8"))
+            policy = read_policy()
             for name, item in files.items():
                 if not isinstance(item, dict) or not selected_file(name, self.config["folders"]) or not allowed_file(name, item.get("size"), policy) or not isinstance(item.get("sha256"), str):
                     raise ValueError("Invalid document inventory")
@@ -834,6 +902,10 @@ class Controller:
             else:
                 if action in ("start", "restart") and self.ingest and self.ingest.poll() is None:
                     raise ValueError("Wait until indexing finishes before starting MCP")
+                if action in ("start", "restart"):
+                    self.mcp_restarts = 0
+                    self.mcp_restart_not_before = 0.0
+                    self.mcp_error_text = ""
                 if action in ("stop", "restart"):
                     self._stop_mcp()
                 self.config["mcp_enabled"] = action != "stop"
@@ -904,6 +976,8 @@ class Controller:
             raise ValueError("Invalid document source mode")
         if mode == "host_agent":
             selected_host = host_root(values.get("host_root", self.config["host_root"]))
+            if not root_allowed(selected_host, self.config.get("acl_allow_roots")):
+                raise ValueError("This host root is not in the allowed-roots list")
             selected_root = HOST_SOURCE
             selected_root.mkdir(parents=True, exist_ok=True)
             folders = values.get("folders", self.config["folders"])
@@ -912,7 +986,10 @@ class Controller:
             folders = list(dict.fromkeys(folders))
         else:
             selected_host = ""
-            selected_root = validate_source_root(values.get("source_root", self.config["source_root"]))
+            selected_root = validate_source_root(
+                values.get("source_root", self.config["source_root"]),
+                self.config.get("acl_allow_roots"),
+            )
             if selected_root.is_relative_to(HOST_SOURCE):
                 raise ValueError("The host sync copy cannot be selected as a mounted folder")
             folders = normalize_folders(values.get("folders", [values["subfolder"]] if "subfolder" in values else self.config["folders"]), selected_root)
@@ -946,6 +1023,92 @@ class Controller:
             if enabled:
                 self._start_mcp()
             return dict(self.config)
+
+    def set_access(self, values):
+        """Persist MCP auth, the ACL and lexical options from Settings."""
+        enabled = values.get("mcp_auth_enabled", self.config.get("mcp_auth_enabled", False))
+        if type(enabled) is not bool:
+            raise ValueError("Invalid MCP auth state")
+        allow = values.get("acl_allow_roots", self.config.get("acl_allow_roots", []))
+        deny = values.get("acl_deny_directories", self.config.get("acl_deny_directories", []))
+        bigrams = values.get("lexical_bigrams", self.config.get("lexical_bigrams", False))
+        if (
+            not isinstance(allow, list)
+            or len(allow) > 64
+            or any(not isinstance(x, str) or not x or len(x) > 4096 for x in allow)
+        ):
+            raise ValueError("acl_allow_roots must be a list of absolute paths")
+        try:
+            clean_allow = list(dict.fromkeys(host_root(x) for x in allow))
+        except ValueError as exc:
+            raise ValueError(str(exc)) from exc
+        if (
+            not isinstance(deny, list)
+            or len(deny) > 128
+            or any(
+                not isinstance(x, str)
+                or not x.strip()
+                or len(x) > 128
+                or "/" in x
+                or "\\" in x
+                for x in deny
+            )
+        ):
+            raise ValueError("acl_deny_directories must be a list of directory names")
+        clean_deny = list(dict.fromkeys(x.strip().casefold() for x in deny))
+        if type(bigrams) is not bool:
+            raise ValueError("lexical_bigrams must be a boolean")
+        token_value = values.get("mcp_auth_token")
+        with self.lock:
+            if self.ingest and self.ingest.poll() is None:
+                raise ValueError("Wait until indexing finishes before changing access settings")
+            previous_token = self.mcp_auth_token()
+            documents_changed = (
+                clean_allow != self.config.get("acl_allow_roots", [])
+                or clean_deny != self.config.get("acl_deny_directories", [])
+                or bigrams != self.config.get("lexical_bigrams", False)
+            )
+            restart = (
+                enabled != self.config.get("mcp_auth_enabled", False)
+                or documents_changed
+                or (
+                    isinstance(token_value, str)
+                    and bool(token_value)
+                    and token_value != previous_token
+                )
+            )
+            if enabled:
+                token = (
+                    token_value
+                    if isinstance(token_value, str) and token_value
+                    else previous_token or secrets.token_urlsafe(32)
+                )
+                if not 12 <= len(token) <= 1024:
+                    raise ValueError("MCP access token must be 12-1024 characters")
+                tmp = MCP_AUTH.with_suffix(".tmp")
+                tmp.write_text(json.dumps({"token": token}), encoding="utf-8")
+                tmp.replace(MCP_AUTH)
+            self.config.update(
+                mcp_auth_enabled=enabled,
+                acl_allow_roots=clean_allow,
+                acl_deny_directories=clean_deny,
+                lexical_bigrams=bigrams,
+            )
+            # A revision bump makes the host agent re-read the ACL on its next poll.
+            # Only document-affecting changes trigger a rescan, not a pure auth toggle.
+            if documents_changed:
+                self.config["sync_revision"] += 1
+            self._save()
+            if restart and self.config["mcp_enabled"]:
+                self._stop_mcp()
+                self._start_mcp()
+            return {
+                "mcp_auth_enabled": enabled,
+                "mcp_auth_token": self.mcp_auth_token() if enabled else None,
+                "acl_allow_roots": clean_allow,
+                "acl_deny_directories": clean_deny,
+                "lexical_bigrams": bigrams,
+            }
 
     def run_index(self, dry_run=False, rebuild=False):
         with self.lock:
@@ -1030,6 +1193,17 @@ class Controller:
         if self.config["qdrant_enabled"] and bundled_qdrant and (self.qdrant is None or self.qdrant.poll() is not None):
             self._start_qdrant()
         if self.config["mcp_enabled"] and (not bundled_qdrant or self.config["qdrant_enabled"]) and (self.mcp is None or self.mcp.poll() is not None) and not (self.ingest and self.ingest.poll() is None):
+            # Exponential backoff with a cap prevents an invalid MCP config
+            # (bad transport/port) from producing a silent, unbounded crash loop.
+            now = time.time()
+            if now < getattr(self, "mcp_restart_not_before", 0.0):
+                return
+            restarts = getattr(self, "mcp_restarts", 0) + 1
+            self.mcp_restarts = restarts
+            self.mcp_restart_not_before = now + min(300.0, 30.0 * (2 ** min(restarts - 1, 4)))
+            if restarts > 8:
+                self.mcp_error_text = "MCP keeps crashing. Review Settings and the MCP log."
+                return
             self._start_mcp()
 
     def _schedule(self):
@@ -1282,11 +1456,35 @@ class Controller:
         except Exception:
             qdrant = False
         try:
-            with socket.create_connection(("127.0.0.1", mcp_port), timeout=0.5):
-                mcp_reachable = True
-        except OSError:
+            # A real HTTP health check (not a bare TCP connect): the MCP app
+            # must be serving /healthz, not merely holding a port open. Use
+            # http.client directly so no proxy/env lookup can stall status().
+            import http.client
+
+            connection = http.client.HTTPConnection("127.0.0.1", mcp_port, timeout=0.4)
+            try:
+                connection.request("GET", "/healthz")
+                mcp_reachable = connection.getresponse().status == 200
+            finally:
+                connection.close()
+        except Exception:
             mcp_reachable = False
+        mcp_log_tail = ""
+        mcp_log = DATA / "mcp.log"
+        if mcp_log.exists():
+            try:
+                with mcp_log.open("rb") as output:
+                    output.seek(0, 2)
+                    output.seek(max(0, output.tell() - 4000))
+                    mcp_log_tail = output.read().decode("utf-8", errors="replace")
+            except OSError:
+                mcp_log_tail = ""
         with self.lock:
+            if mcp_reachable:
+                # A healthy MCP clears the crash-restart backoff state.
+                self.mcp_restarts = 0
+                self.mcp_restart_not_before = 0.0
+                self.mcp_error_text = ""
             if self.ingest and self.ingest.poll() is not None and not self.ingest_finalized:
                 self._finish_index(self.ingest, self.ingest_dry_run)
             try:
@@ -1322,6 +1520,13 @@ class Controller:
                     output.seek(max(0, output.tell() - 12000))
                     tail = output.read().decode("utf-8", errors="replace")
             index_errors, index_skipped, error_origin = self.index_issues()
+            mcp_exit_code = None
+            if self.mcp is not None:
+                try:
+                    polled = self.mcp.poll()
+                    mcp_exit_code = polled if type(polled) is int else None
+                except Exception:
+                    mcp_exit_code = None
             result = {
                 "config": dict(self.config),
                 "version": APP_VERSION,
@@ -1338,6 +1543,14 @@ class Controller:
                 "qdrant_managed": Path("/qdrant/qdrant").exists(),
                 "qdrant_running": bool(self.qdrant and self.qdrant.poll() is None) if Path("/qdrant/qdrant").exists() else qdrant,
                 "mcp_running": bool(self.mcp and self.mcp.poll() is None and mcp_reachable),
+                "mcp_auth": {
+                    "enabled": bool(self.config.get("mcp_auth_enabled")),
+                    "token": self.mcp_auth_token(),
+                },
+                "mcp_restarts": getattr(self, "mcp_restarts", 0),
+                "mcp_error_text": getattr(self, "mcp_error_text", ""),
+                "mcp_exit_code": mcp_exit_code,
+                "mcp_log_tail": mcp_log_tail,
                 "index_running": bool(self.ingest and self.ingest.poll() is None),
                 "source_ready": source_ready,
                 "scan_complete": scan_complete,
@@ -1537,7 +1750,7 @@ class Handler(BaseHTTPRequestHandler):
             if controller.config["source_mode"] == "host_agent" and not controller.host_source_ready():
                 self.send(200, json.dumps({"folders": [""], "root": controller.config["host_root"]}))
                 return
-            policy = yaml.safe_load(POLICY.read_text(encoding="utf-8"))
+            policy = read_policy()
             excluded = {x.casefold() for x in policy["exclude_directories"]}
             excluded_top = {x.casefold() for x in policy["exclude_top_level"]}
             folders = [""]
@@ -1711,6 +1924,8 @@ class Handler(BaseHTTPRequestHandler):
                 raise ValueError("Invalid data")
             if route.path == "/api/config":
                 result = controller.update(values)
+            elif route.path == "/api/access":
+                result = controller.set_access(values)
             elif route.path == "/api/embedding-model":
                 result = controller.select_embedding_model(values.get("model"))
             elif route.path == "/api/agent/pair":

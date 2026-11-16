@@ -154,6 +154,38 @@ async function saveSchedule() {
   try { await api('/api/config', {interval_hours: Number($('interval').value)}); message('Schedule saved.'); await refresh(); }
   catch (e) { message(e.message, true); }
 }
+function lines(id) {
+  return ($(id).value || '').split('\n').map(x => x.trim()).filter(Boolean);
+}
+function bindAccessSettings(s) {
+  const auth = s.mcp_auth || {};
+  const cfg = s.config || {};
+  if (document.activeElement !== $('mcp-auth-enabled')) $('mcp-auth-enabled').checked = Boolean(auth.enabled);
+  if (document.activeElement !== $('mcp-auth-token')) $('mcp-auth-token').value = auth.token || '';
+  if (document.activeElement !== $('acl-allow-roots')) $('acl-allow-roots').value = (cfg.acl_allow_roots || []).join('\n');
+  if (document.activeElement !== $('acl-deny-dirs')) $('acl-deny-dirs').value = (cfg.acl_deny_directories || []).join('\n');
+  if (document.activeElement !== $('lexical-bigrams')) $('lexical-bigrams').checked = Boolean(cfg.lexical_bigrams);
+}
+async function saveAccess() {
+  const status = $('access-status');
+  if (status) status.textContent = 'Saving…';
+  try {
+    const result = await api('/api/access', {
+      mcp_auth_enabled: $('mcp-auth-enabled').checked,
+      mcp_auth_token: ($('mcp-auth-token').value || '').trim(),
+      acl_allow_roots: lines('acl-allow-roots'),
+      acl_deny_directories: lines('acl-deny-dirs'),
+      lexical_bigrams: $('lexical-bigrams').checked
+    });
+    if (status) status.textContent = result.mcp_auth_enabled
+      ? 'Saved. Give the access token to your MCP client as a Bearer header.'
+      : 'Saved. MCP authentication is disabled.';
+    await refresh();
+  } catch (e) {
+    if (status) status.textContent = e.message;
+    message(e.message, true);
+  }
+}
 function renderScanStatus(s) {
   const progress = $('setup-sync-progress');
   const phase = s.agent_progress?.phase;
@@ -654,6 +686,7 @@ async function refresh() {
     $('wizard-qdrant').disabled = !s.qdrant_managed;
     $('next-run').textContent = s.next_run_at ? 'Next update: ' + new Date(s.next_run_at * 1000).toLocaleString('en-GB') : 'Scheduling is off';
     if (document.activeElement !== $('interval')) $('interval').value = s.config.interval_hours;
+    bindAccessSettings(s);
     if (s.index_running && s.index_progress?.stage === 'dry_run') $('dry-result').textContent = 'Dry run in progress…';
     else if (s.last_result?.dry_run && !s.index_running) $('dry-result').textContent = s.last_result.exit_code === 0 ? 'Dry run passed. You can continue to indexing.' : 'Dry run failed. Review the log and retry.';
     $('dry-next').disabled = !(s.last_result?.dry_run && !s.index_running && s.last_result.exit_code === 0);

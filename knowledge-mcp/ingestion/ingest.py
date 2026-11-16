@@ -126,7 +126,27 @@ QDRANT_URL = os.getenv("QDRANT_URL", "http://127.0.0.1:6333")
 CHUNK_SIZE = int(os.getenv("CHUNK_SIZE", "1200"))
 CHUNK_OVERLAP = int(os.getenv("CHUNK_OVERLAP", "200"))
 EMBED_BATCH_SIZE = int(os.getenv("EMBED_BATCH_SIZE", "32"))
+# Bump whenever parsing, chunking rules, redaction or the lexical representation
+# change. It is part of the index signature so an incremental update reprocesses
+# existing documents instead of silently keeping stale chunks/vectors.
+PIPELINE_VERSION = 3
 _model_lock = threading.Lock()
+
+
+def env_deny_directories(policy):
+    """Merge the Settings ACL deny list (delivered via env) into the policy.
+
+    Ingestion and retrieval are separate processes, so the dashboard passes the
+    ACL through ``ACL_DENY_DIRECTORIES``. Values are directory names only.
+    """
+    raw = os.getenv("ACL_DENY_DIRECTORIES", "")
+    names = [
+        name.strip().casefold()
+        for name in raw.split(",")
+        if name.strip() and "/" not in name and "\\" not in name
+    ]
+    policy["acl_deny_directories"] = names
+    return policy
 
 
 def load_policy():
@@ -134,6 +154,7 @@ def load_policy():
         policy = yaml.safe_load(f)
     remove_legacy_default_exclusions(policy)
     ensure_required_exclusions(policy)
+    env_deny_directories(policy)
     root = os.getenv("KNOWLEDGE_ROOT") or policy.get("knowledge_root")
     if not root or root.startswith("${") or root == "/path/to/knowledge/root":
         raise ValueError(
@@ -310,7 +331,11 @@ def is_candidate(path, root, policy):
         name.casefold() for name in (policy.get("exclude_directories") or [])
     } | REQUIRED_DIRECTORY_NAMES
 
-    if any(part.casefold() in excluded_dirs | excluded_top for part in relative.parts[:-1]):
+    acl_deny = {
+        name.casefold() for name in (policy.get("acl_deny_directories") or [])
+    }
+
+    if any(part.casefold() in excluded_dirs | excluded_top | acl_deny for part in relative.parts[:-1]):
         return False
 
     excluded_files = {name.casefold() for name in policy.get("exclude_files", [])}
@@ -366,7 +391,10 @@ def discover_documents(policy):
     excluded_top = {
         name.casefold() for name in (policy.get("exclude_top_level") or [])
     } | REQUIRED_TOP_LEVEL_NAMES
-    restricted_dirs = excluded_dirs | excluded_top
+    acl_deny = {
+        name.casefold() for name in (policy.get("acl_deny_directories") or [])
+    }
+    restricted_dirs = excluded_dirs | excluded_top | acl_deny
 
     def unreadable(error):
         raise OSError(f"Document scan incomplete: {error}") from error
@@ -422,15 +450,29 @@ def parse_txt_or_md(path):
     text = raw.decode(encoding)
 
     if path.suffix.lower() != ".md":
-        return [{"text": normalize_text(text), "page": None, "section": None}]
+        return [
+            {
+                "text": normalize_text(text),
+                "page": None,
+                "section": None,
+                "section_path": path.stem,
+            }
+        ]
     sections, buffer, heading, fence = [], [], None, None
+    heading_stack = []
+
+    def breadcrumb():
+        return " / ".join(title for _, title in heading_stack) or path.stem
+
     for line in text.splitlines():
         stripped = line.lstrip()
         if stripped.startswith(("```", "~~~")):
             marker = stripped[0]
             fence = None if fence == marker else marker if fence is None else fence
         match = (
-            re.match(r"^ {0,3}#{1,6}\s+(.+?)\s*#*\s*$", line) if fence is None else None
+            re.match(r"^ {0,3}(#{1,6})\s+(.+?)\s*#*\s*$", line)
+            if fence is None
+            else None
         )
         if match:
             if buffer:
@@ -439,9 +481,14 @@ def parse_txt_or_md(path):
                         "text": normalize_text("\n".join(buffer)),
                         "page": None,
                         "section": heading,
+                        "section_path": breadcrumb(),
                     }
                 )
-            heading, buffer = match.group(1), [line]
+            level = len(match.group(1))
+            heading = match.group(2)
+            heading_stack[:] = [pair for pair in heading_stack if pair[0] < level]
+            heading_stack.append((level, heading))
+            buffer = [line]
         else:
             buffer.append(line)
     if buffer:
@@ -450,6 +497,7 @@ def parse_txt_or_md(path):
                 "text": normalize_text("\n".join(buffer)),
                 "page": None,
                 "section": heading,
+                "section_path": breadcrumb(),
             }
         )
     return sections
@@ -462,6 +510,11 @@ def parse_html(path):
         tag.decompose()
 
     sections, buffer, heading = [], [], None
+    heading_stack = []
+
+    def breadcrumb():
+        return " / ".join(title for _, title in heading_stack) or path.stem
+
     for element in (soup.body or soup).descendants:
         if isinstance(element, Tag) and re.fullmatch(r"h[1-6]", element.name or ""):
             if buffer:
@@ -470,10 +523,14 @@ def parse_html(path):
                         "text": normalize_text("\n".join(buffer)),
                         "page": None,
                         "section": heading,
+                        "section_path": breadcrumb(),
                     }
                 )
             buffer = []
             heading = element.get_text(" ", strip=True)
+            level = int(element.name[1])
+            heading_stack[:] = [pair for pair in heading_stack if pair[0] < level]
+            heading_stack.append((level, heading))
         elif isinstance(element, NavigableString) and element.strip():
             buffer.append(str(element).strip())
     if buffer:
@@ -482,6 +539,7 @@ def parse_html(path):
                 "text": normalize_text("\n".join(buffer)),
                 "page": None,
                 "section": heading,
+                "section_path": breadcrumb(),
             }
         )
     return sections
@@ -753,6 +811,12 @@ def document_records(path, model=None):
                 "text": chunk,
                 "page": section["page"],
                 "section": redact_secrets(section["section"]),
+                "section_path": redact_secrets(
+                    section.get("section_path") or section["section"] or path.stem
+                ),
+                "title": path.stem,
+                "language": None,
+                "char_count": len(chunk),
                 "filename": path.name,
             }
             fitted = fit_model_chunks(record, model) if model is not None else [record]
@@ -919,7 +983,15 @@ def run_ingestion(args):
         save_state(state)
     signature = hashlib.sha256(
         json.dumps(
-            [INDEX_VERSION, MODEL_NAME, CHUNK_SIZE, CHUNK_OVERLAP], sort_keys=True
+            [
+                INDEX_VERSION,
+                MODEL_NAME,
+                CHUNK_SIZE,
+                CHUNK_OVERLAP,
+                PIPELINE_VERSION,
+                os.getenv("LEXICAL_BIGRAMS", ""),
+            ],
+            sort_keys=True,
         ).encode()
     ).hexdigest()
     indexed, skipped, failed, indexed_chunks = 0, 0, 0, 0
@@ -995,6 +1067,9 @@ def run_ingestion(args):
                 records = document_records(primary, embedding_model)
                 generation = hashlib.sha256((signature + source).encode()).hexdigest()
                 metadata = source_metadata(source, duplicates)
+                # Path terms feed the lexical index; redact them so a credential
+                # accidentally present in a filename is not indexed verbatim.
+                safe_source = redact_secrets(source)
                 record_state(
                     state,
                     document_id,
@@ -1045,7 +1120,7 @@ def run_ingestion(args):
                                 vector={
                                     "": vector.tolist(),
                                     LEXICAL_VECTOR: sparse_vector(
-                                        record["text"], source, record["section"]
+                                        record["text"], safe_source, record["section"]
                                     ),
                                 },
                                 payload=payload,
@@ -1133,14 +1208,19 @@ def run_ingestion(args):
         # new document_id, so removing the old version up front would discard the
         # last usable copy when the replacement fails to parse.
         if args.limit is None:
-            protected_sources = failed_sources | hash_failure_sources | empty_sources
+            unreadable_sources = failed_sources | hash_failure_sources
             for document_id in set(state["documents"]) - set(hash_to_paths):
                 entry = state["documents"][document_id]
                 entry_sources = {
                     entry.get("source"),
                     *entry.get("duplicate_sources", []),
                 }
-                if entry_sources & protected_sources:
+                # Legacy entries (no versioned signature) cannot satisfy v2 search
+                # filters; preserve them only when a real read/parse error blocked
+                # migration, never when a scanned/image-only file was cleanly skipped.
+                if entry_sources & unreadable_sources:
+                    continue
+                if entry.get("signature") and (entry_sources & empty_sources):
                     continue
                 try:
                     client.delete(
@@ -1158,6 +1238,32 @@ def run_ingestion(args):
                     record_state(state, document_id, None)
                 except Exception as exc:
                     log_error(None, RuntimeError(f"Failed to remove {document_id}: {exc}"))
+            if not failed and not hash_failures:
+                try:
+                    client.delete(
+                        COLLECTION_NAME,
+                        points_selector=Filter(
+                            must_not=[
+                                Filter(
+                                    must=[
+                                        FieldCondition(
+                                            key="index_version",
+                                            match=MatchValue(value=INDEX_VERSION),
+                                        ),
+                                        FieldCondition(
+                                            key="embedding_model",
+                                            match=MatchValue(value=MODEL_NAME),
+                                        ),
+                                    ]
+                                )
+                            ]
+                        ),
+                        wait=True,
+                    )
+                except Exception as exc:
+                    log_error(
+                        None, RuntimeError(f"Failed to remove legacy chunks: {exc}")
+                    )
         state["files"] = current_files
     finally:
         save_state(state)

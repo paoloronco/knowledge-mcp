@@ -19,7 +19,7 @@ from collections import deque
 from pathlib import Path, PurePosixPath
 
 sys.path.insert(0, str(Path(__file__).resolve().parent / "mcp"))
-from host_sync import allowed_file, host_root, cached_file_hash
+from host_sync import allowed_file, host_root, cached_file_hash, root_allowed
 
 
 DEFAULT_CONFIG = Path.home() / ".config" / "knowledge-mcp" / "agent.json"
@@ -51,8 +51,10 @@ def file_hash(path):
     return digest.hexdigest()
 
 
-def resolve_host_folder(root, host_mount=None):
+def resolve_host_folder(root, host_mount=None, allow_roots=None):
     value = host_root(root)
+    if not root_allowed(value, allow_roots):
+        raise ValueError("This host folder is not in the allowed-roots list")
     if host_mount is None:
         return Path(value).expanduser().resolve()
     if not value.startswith("/") or "\\" in value or ":" in value:
@@ -87,13 +89,14 @@ def resolve_host_folder(root, host_mount=None):
 
 
 def inventory(root, policy, host_mount=None, progress=None, folders=None, hash_cache=None):
-    folder = resolve_host_folder(root, host_mount)
+    folder = resolve_host_folder(root, host_mount, policy.get("acl_allow_roots"))
     if not folder.is_dir():
         raise ValueError(f"Host folder is unavailable: {root}")
     folder = folder.resolve()
     if folder == Path(folder.anchor):
         raise ValueError("Choose a folder, not a filesystem root")
     restricted = {x.casefold() for x in policy["exclude_directories"] + policy["exclude_top_level"]}
+    restricted |= {x.casefold() for x in (policy.get("acl_deny_directories") or [])}
     logical = folder.relative_to(host_mount.resolve()) if host_mount is not None else folder
     original_parts = PurePosixPath(host_root(root)).parts if host_mount is not None else folder.parts
     if any(part.casefold() in restricted for part in (*logical.parts, *original_parts)):
@@ -243,7 +246,7 @@ def heartbeat(base, token, done):
 
 def check_folder(base, token, probe, host_mount):
     try:
-        folder = resolve_host_folder(probe["path"], host_mount)
+        folder = resolve_host_folder(probe["path"], host_mount, probe.get("acl_allow_roots"))
         if not folder.is_dir():
             raise ValueError(f"Host folder is unavailable: {probe['path']}")
         with os.scandir(folder) as entries:

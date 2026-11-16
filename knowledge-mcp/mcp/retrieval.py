@@ -1,8 +1,10 @@
 """Bounded, live Qdrant retrieval and indexed-document navigation."""
 
+import hashlib
 import os
 import re
 import threading
+import time
 from pathlib import Path, PurePosixPath
 
 import yaml
@@ -37,6 +39,9 @@ LEXICAL_LIMIT = 80
 FINAL_LIMIT = 8
 MAX_CONTEXT_CHARS = 6000
 BACKEND_MESSAGE = "Qdrant is unavailable. Check the service and retry."
+MODEL_MESSAGE = (
+    "The embedding model is unavailable. Check the model cache and device, then retry."
+)
 MIGRATION_MESSAGE = (
     "This collection was created by an older release. Run an incremental update "
     "for each embedding model to enable hybrid search and document navigation."
@@ -50,15 +55,28 @@ _policy_cache = None
 _policy_stamp = None
 _policy_lock = threading.Lock()
 
+# The migration check used to run an exact (full-scan) filtered count on every
+# request. A cheap point-count fingerprint lets us reuse the result until the
+# collection actually changes, with a short TTL as a safety net for a separate
+# ingestion process that cannot signal this process directly.
+_MIGRATION_CACHE_TTL = 30.0
+_migration_cache = {
+    "client": None,
+    "fingerprint": None,
+    "lexical": None,
+    "needs": None,
+    "stamp": 0.0,
+}
+
 
 def _policy_file_stamp():
     try:
-        info = POLICY_FILE.stat()
+        data = POLICY_FILE.read_bytes()
     except OSError:
         return None
-    # The Web UI replaces the policy file on every save, so the inode catches
-    # edits even where st_mtime resolution is too coarse to change.
-    return (info.st_mtime_ns, info.st_size, info.st_ino)
+    # A content hash is robust to inode reuse, coarse mtime resolution and
+    # in-place edits; the policy file is small, so reading it is cheap.
+    return hashlib.sha256(data).hexdigest()
 
 
 def load_policy():
@@ -74,9 +92,24 @@ def load_policy():
         )
         remove_legacy_default_exclusions(policy)
         ensure_required_exclusions(policy)
+        policy["acl_deny_directories"] = _env_deny_directories()
         _policy_cache = policy
         _policy_stamp = stamp
         return policy
+
+
+def _env_deny_directories():
+    """Sensitive directory names configured in Settings, delivered via env.
+
+    Ingestion and retrieval run as separate processes, so the ACL travels
+    through ``ACL_DENY_DIRECTORIES`` (set by the dashboard in ``_env``).
+    """
+    raw = os.getenv("ACL_DENY_DIRECTORIES", "")
+    return [
+        name.strip().casefold()
+        for name in raw.split(",")
+        if name.strip() and "/" not in name and "\\" not in name
+    ]
 
 
 def invalidate_policy_cache():
@@ -84,6 +117,7 @@ def invalidate_policy_cache():
     with _policy_lock:
         _policy_cache = None
         _policy_stamp = None
+    invalidate_collection_cache()
 
 
 def classify_source(source):
@@ -119,6 +153,9 @@ def source_allowed(source, policy):
     excluded_top_level = {
         name.casefold() for name in (policy.get("exclude_top_level") or [])
     }
+    acl_deny = {
+        name.casefold() for name in (policy.get("acl_deny_directories") or [])
+    }
     included = {name.casefold() for name in (policy.get("include_extensions") or [])}
     excluded_extensions = {
         name.casefold() for name in (policy.get("exclude_extensions") or [])
@@ -126,6 +163,7 @@ def source_allowed(source, policy):
     return (
         not directories.intersection(excluded_top_level)
         and not directories.intersection(excluded_directories)
+        and not directories.intersection(acl_deny)
         and path.name.casefold() not in excluded
         and path.as_posix().casefold() not in excluded
         and path.suffix.lower() in included
@@ -183,8 +221,9 @@ def query_filter(policy, include_historical=False, path_prefix="", source=""):
         condition("embedding_model", MODEL_NAME),
     ]
     must_not = []
-    excluded_directories = [v.casefold() for v in (policy.get("exclude_directories") or [])]
-    excluded_top_level = [v.casefold() for v in (policy.get("exclude_top_level") or [])]
+    acl_deny = [v.casefold() for v in (policy.get("acl_deny_directories") or [])]
+    excluded_directories = [v.casefold() for v in (policy.get("exclude_directories") or [])] + acl_deny
+    excluded_top_level = [v.casefold() for v in (policy.get("exclude_top_level") or [])] + acl_deny
     directory_exclusions = sorted(set(excluded_directories) | set(excluded_top_level))
     if directory_exclusions:
         must_not.append(
@@ -260,13 +299,13 @@ def index_available():
     return client.collection_exists(DENSE_COLLECTION)
 
 
-def backend_failure(exc, **fields):
+def backend_failure(exc, message=None, **fields):
     return sanitize(
         {
             **fields,
             "backend": "unavailable",
             "reason": type(exc).__name__,
-            "message": BACKEND_MESSAGE,
+            "message": message or BACKEND_MESSAGE,
         }
     )
 
@@ -284,17 +323,56 @@ def legacy_chunk_count():
                 )
             ]
         ),
-        exact=False,
+        exact=True,
     ).count
 
 
+def invalidate_collection_cache():
+    _migration_cache.update(
+        client=None, fingerprint=None, lexical=None, needs=None, stamp=0.0
+    )
+
+
+def _collection_fingerprint():
+    try:
+        return client.count(DENSE_COLLECTION, exact=False).count
+    except Exception:
+        return None
+
+
 def collection_needs_update(info=None):
+    """Cached migration check: the exact legacy count runs only when the
+    collection's point count or schema actually changes (or the TTL expires),
+    instead of on every single search/browse/read request."""
     try:
         info = info if info is not None else client.get_collection(DENSE_COLLECTION)
-        return (
-            LEXICAL_VECTOR not in (info.config.params.sparse_vectors or {})
-            or legacy_chunk_count() > 0
+        lexical = LEXICAL_VECTOR in (info.config.params.sparse_vectors or {})
+        cache = _migration_cache
+        # Holding the client object also prevents id() reuse across short-lived
+        # test clients from returning a stale result.
+        if cache["client"] is not client:
+            invalidate_collection_cache()
+            cache["client"] = client
+        now = time.monotonic()
+        fingerprint = _collection_fingerprint()
+        if (
+            cache["needs"] is not None
+            and cache["lexical"] == lexical
+            and cache["fingerprint"] == fingerprint
+            and now - cache["stamp"] < _MIGRATION_CACHE_TTL
+        ):
+            return cache["needs"]
+        if not lexical:
+            needs = True
+        else:
+            try:
+                needs = legacy_chunk_count() > 0
+            except Exception:
+                needs = False
+        cache.update(
+            lexical=lexical, fingerprint=fingerprint, needs=needs, stamp=now
         )
+        return needs
     except Exception:
         return False
 
@@ -310,6 +388,12 @@ def sanitize(value):
 
 
 def public_chunk(payload, policy):
+    source = payload.get("source") or ""
+    text = payload.get("text", "")
+    parent_dir = payload.get("parent_dir")
+    if parent_dir is None:
+        parts = PurePosixPath(source.replace("\\", "/")).parts
+        parent_dir = PurePosixPath(*parts[:-1]).as_posix() if len(parts) > 1 else ""
     return {
         "document_id": payload.get("document_id"),
         "source": payload.get("source"),
@@ -318,17 +402,24 @@ def public_chunk(payload, policy):
         ],
         "page": payload.get("page"),
         "section": payload.get("section"),
+        "section_path": payload.get("section_path") or payload.get("section"),
+        "title": payload.get("title"),
+        "parent_dir": parent_dir,
+        "language": payload.get("language"),
+        "char_count": payload.get("char_count", len(text)),
         "section_index": payload.get("section_index"),
         "chunk_index": payload.get("chunk_index"),
         "document_order": payload.get("document_order"),
         "total_chunks": payload.get("total_chunks"),
         "modified_at": payload.get("modified_at"),
-        "text": payload.get("text", ""),
+        "text": text,
         **classify_source(payload.get("source")),
     }
 
 
-def read_document(document_id, start_chunk=0, limit=8, include_historical=False):
+def read_document(
+    document_id, start_chunk=0, limit=8, include_historical=False, _available=None
+):
     if not isinstance(document_id, str) or not re.fullmatch(
         r"[a-f0-9]{64}", document_id
     ):
@@ -343,7 +434,7 @@ def read_document(document_id, start_chunk=0, limit=8, include_historical=False)
             "start_chunk must be nonnegative and limit must be between 1 and 20"
         )
     try:
-        available = index_available()
+        available = _available if _available is not None else index_available()
     except Exception as exc:
         return backend_failure(
             exc, document_id=document_id, chunks=[], next_chunk=None
@@ -436,9 +527,18 @@ def browse_documents(path_prefix="", limit=30, cursor=None, include_historical=F
             item = public_chunk(payload, policy)
             item["text"] = item["text"][:300]
             documents.append(item)
+    # Navigation: list the immediate subfolders under path_prefix so a client
+    # can walk the indexed library instead of only scanning document_order 0.
+    prefix_parts = PurePosixPath(path_prefix).parts if path_prefix else ()
+    folders = set()
+    for item in documents:
+        parts = PurePosixPath((item.get("source") or "").replace("\\", "/")).parts
+        if len(parts) > len(prefix_parts) + 1:
+            folders.add(parts[len(prefix_parts)])
     result = {
         "path_prefix": path_prefix,
         "documents": documents,
+        "folders": sorted(folders),
         "next_cursor": str(offset) if offset is not None else None,
     }
     if not documents and collection_needs_update():
@@ -458,7 +558,9 @@ def expand_result_context(item, include_historical=False):
     if not document_id:
         return unchanged
     start = max(0, payload.get("document_order", 0) - 1)
-    result = read_document(document_id, start, 3, include_historical)
+    # The caller already confirmed the collection exists; skip a redundant
+    # collection_exists round-trip for each expanded result.
+    result = read_document(document_id, start, 3, include_historical, _available=True)
     chunks = [
         chunk
         for chunk in result.get("chunks", [])
@@ -477,6 +579,28 @@ def expand_result_context(item, include_historical=False):
             for chunk in chunks
         ],
     }
+
+
+def ensure_model():
+    """Load the dense model once, under a lock. Safe to call from a warm-up
+    thread at startup so the first real query does not pay the cold-start cost."""
+    global model
+    if model is None:
+        with _model_lock:
+            if model is None:
+                from sentence_transformers import SentenceTransformer
+
+                model = SentenceTransformer(MODEL_NAME, device=embedding_device())
+    return model
+
+
+def warm_model():
+    """Best-effort preload used by the server's startup thread (never raises)."""
+    try:
+        ensure_model()
+        return True
+    except Exception:
+        return False
 
 
 def search(
@@ -516,26 +640,20 @@ def search(
         return backend_failure(exc, query=query, results=[], result_count=0)
     needs_update = collection_needs_update(info)
     lexical_available = LEXICAL_VECTOR in (info.config.params.sparse_vectors or {})
-    global model
-    current_model = model
-    if current_model is None:
-        with _model_lock:
-            if model is None:
-                try:
-                    from sentence_transformers import SentenceTransformer
-
-                    model = SentenceTransformer(MODEL_NAME, device=embedding_device())
-                except Exception as exc:
-                    return backend_failure(
-                        exc, query=query, results=[], result_count=0
-                    )
-            current_model = model
+    try:
+        current_model = ensure_model()
+    except Exception as exc:
+        return backend_failure(
+            exc, message=MODEL_MESSAGE, query=query, results=[], result_count=0
+        )
     try:
         vector = current_model.encode(
             [query_text(MODEL_NAME, query)], normalize_embeddings=True
         )[0].tolist()
     except Exception as exc:
-        return backend_failure(exc, query=query, results=[], result_count=0)
+        return backend_failure(
+            exc, message=MODEL_MESSAGE, query=query, results=[], result_count=0
+        )
     try:
         dense_groups = client.query_points_groups(
             DENSE_COLLECTION,

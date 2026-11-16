@@ -195,6 +195,95 @@ class RetrievalHardeningTest(unittest.TestCase):
             ["good.md"],
         )
 
+    def test_incremental_update_clears_legacy_flag_with_skipped_docs_and_orphan_points(
+        self,
+    ):
+        from pypdf import PdfWriter
+
+        writer = PdfWriter()
+        writer.add_blank_page(width=200, height=200)
+        scanned = self.root / "scanned.pdf"
+        with scanned.open("wb") as output:
+            writer.write(output)
+        self.write("good.md", "Qdrant telescope VLAN 42 configuration.")
+
+        self.client.create_collection(
+            ingest.COLLECTION_NAME,
+            models.VectorParams(size=3, distance=models.Distance.COSINE),
+        )
+        old_scanned_id = ingest.sha256_file(scanned)
+        self.client.upsert(
+            ingest.COLLECTION_NAME,
+            [
+                models.PointStruct(
+                    id=101,
+                    vector=[1.0, 0.0, 0.0],
+                    payload={
+                        "document_id": old_scanned_id,
+                        "source": "scanned.pdf",
+                        "text": "legacy v1 scanned entry",
+                    },
+                ),
+                models.PointStruct(
+                    id=102,
+                    vector=[1.0, 0.0, 0.0],
+                    payload={
+                        "document_id": "f" * 64,
+                        "source": "orphan-not-in-state.md",
+                        "text": "orphan legacy v1 point",
+                    },
+                ),
+            ],
+        )
+        ingest.save_state(
+            {
+                "documents": {
+                    old_scanned_id: {
+                        "source": "scanned.pdf",
+                        "duplicate_sources": [],
+                        "chunks": 1,
+                    }
+                }
+            }
+        )
+        self.assertTrue(retrieval.search("VLAN")["index_update_required"])
+
+        self.run_index()
+        self.assertEqual(retrieval.legacy_chunk_count(), 0)
+        result = retrieval.search("VLAN")
+        self.assertNotIn("index_update_required", result)
+        self.assertEqual([r["source"] for r in result["results"]], ["good.md"])
+        self.assertNotIn(old_scanned_id, ingest.load_state()["documents"])
+
+        calls = []
+        real_count = self.client.count
+
+        def capture_count(*args, **kwargs):
+            calls.append(kwargs.get("exact"))
+            return real_count(*args, **kwargs)
+
+        with patch.object(self.client, "count", side_effect=capture_count):
+            self.assertEqual(retrieval.legacy_chunk_count(), 0)
+        self.assertEqual(calls, [True])
+
+        with self.assertRaises(SystemExit):
+            with patch.object(
+                ingest, "parse_document", side_effect=RuntimeError("unreadable file")
+            ):
+                self.write("broken.md", "corrupt")
+                self.client.upsert(
+                    ingest.COLLECTION_NAME,
+                    [
+                        models.PointStruct(
+                            id=103,
+                            vector=[1.0, 0.0, 0.0],
+                            payload={"document_id": "a" * 64, "source": "broken.md"},
+                        )
+                    ],
+                )
+                self.run_index()
+        self.assertTrue(retrieval.search("VLAN")["index_update_required"])
+
     def test_ingest_and_retrieval_read_the_saved_policy_identically(self):
         custom = self.policy()
         custom["exclude_directories"] = custom["exclude_directories"] + ["team-private"]

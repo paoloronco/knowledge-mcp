@@ -66,6 +66,13 @@ function dashboard(config, connected = false, pathname = '/dashboard/indexing') 
         status.config = {...status.config, onboarding_complete: true, setup_step: 7, initial_index_skipped: true};
         result = {complete: true, initial_index_skipped: true};
       }
+      else if (route === '/api/access') {
+        status.mcp_auth = {enabled: body.mcp_auth_enabled, token: body.mcp_auth_token || 'generated-access-token'};
+        status.config.acl_allow_roots = body.acl_allow_roots;
+        status.config.acl_deny_directories = body.acl_deny_directories;
+        status.config.lexical_bigrams = body.lexical_bigrams;
+        result = {...body, mcp_auth_token: status.mcp_auth.token};
+      }
       else if (route === '/api/index') result = {started: true};
       else throw Error('Unexpected request: ' + route);
       return {ok: true, json: async () => result};
@@ -622,4 +629,29 @@ test('a global busy indicator reflects in-flight actions', async () => {
   assert.equal(elements['global-busy'].classList.contains('hidden'), false);
   await vm.runInContext('pendingActions = 0; renderBusy();', context);
   assert.equal(elements['global-busy'].classList.contains('hidden'), true);
+});
+
+test('access control settings render and save to /api/access', async () => {
+  assert.match(html, /id="mcp-auth-enabled"/);
+  assert.match(html, /id="acl-allow-roots"/);
+  assert.match(html, /id="acl-deny-dirs"/);
+  assert.match(html, /id="lexical-bigrams"/);
+  assert.match(html, /onclick="saveAccess\(\)"/);
+  const {elements, context, calls} = dashboard({...legacy, onboarding_complete: true, setup_step: 7});
+  await vm.runInContext('refresh()', context);
+  assert.equal(elements['mcp-auth-enabled'].checked, false);
+  elements['mcp-auth-enabled'].checked = true;
+  elements['mcp-auth-token'].value = 'my-secret-token';
+  elements['acl-allow-roots'].value = '/mnt/docs\n/mnt/shared';
+  elements['acl-deny-dirs'].value = 'hr\nprivate';
+  elements['lexical-bigrams'].checked = true;
+  await vm.runInContext('saveAccess()', context);
+  const access = calls.find(x => x.route === '/api/access');
+  assert.ok(access);
+  assert.equal(access.body.mcp_auth_enabled, true);
+  assert.equal(access.body.mcp_auth_token, 'my-secret-token');
+  assert.deepEqual(access.body.acl_allow_roots, ['/mnt/docs', '/mnt/shared']);
+  assert.deepEqual(access.body.acl_deny_directories, ['hr', 'private']);
+  assert.equal(access.body.lexical_bigrams, true);
+  assert.match(elements['access-status'].textContent, /access token/);
 });

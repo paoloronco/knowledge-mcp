@@ -1,4 +1,7 @@
+import hmac
+import json
 import os
+import threading
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -12,14 +15,15 @@ from retrieval import (
     MIGRATION_MESSAGE,
     client,
     index_available,
-    legacy_chunk_count,
+    collection_needs_update,
     search,
     browse_documents,
     read_document,
     query_filter,
     load_policy,
+    warm_model,
 )
-from index_schema import LEXICAL_VECTOR, INDEX_VERSION
+from index_schema import INDEX_VERSION
 from qdrant_client import models
 
 
@@ -75,10 +79,7 @@ def knowledge_status() -> dict:
                 key="document_order", match=models.MatchValue(value=0)
             )
         )
-        update_required = (
-            legacy_chunk_count() > 0
-            or LEXICAL_VECTOR not in (info.config.params.sparse_vectors or {})
-        )
+        update_required = collection_needs_update(info)
         result.update(
             indexed_chunks=client.count(DENSE_COLLECTION, exact=False).count,
             indexed_documents=client.count(
@@ -153,22 +154,103 @@ def _env_flag(name, default=False):
     return value.strip().lower() in {"1", "true", "yes", "on"}
 
 
-if __name__ == "__main__":
+async def _send_json(send, status, payload, extra_headers=()):
+    body = json.dumps(payload).encode("utf-8")
+    headers = [
+        (b"content-type", b"application/json"),
+        (b"content-length", str(len(body)).encode("ascii")),
+        *extra_headers,
+    ]
+    await send({"type": "http.response.start", "status": status, "headers": headers})
+    await send({"type": "http.response.body", "body": body})
+
+
+class AccessGuard:
+    """ASGI wrapper adding optional bearer-token auth and a liveness endpoint.
+
+    It wraps the Starlette app returned by the MCP SDK without touching tool
+    handlers, so the same guard works for ``streamable-http`` and ``sse``.
+    ``token=None`` disables auth (the default) but still serves ``/healthz``.
+    """
+
+    def __init__(self, app, token):
+        self.app = app
+        self.token = token
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] == "http" and scope.get("path") == "/healthz":
+            await _send_json(send, 200, {"status": "ok", "service": "knowledge-mcp"})
+            return
+        if self.token is not None and scope["type"] in ("http", "websocket"):
+            if not self._authorized(scope):
+                await _send_json(
+                    send,
+                    401,
+                    {"error": "Unauthorized"},
+                    [(b"www-authenticate", b'Bearer realm="knowledge-mcp"')],
+                )
+                return
+        await self.app(scope, receive, send)
+
+    def _authorized(self, scope):
+        headers = dict(scope.get("headers") or [])
+        raw = headers.get(b"authorization", b"").decode("latin-1")
+        provided = raw[7:].strip() if raw.lower().startswith("bearer ") else ""
+        if not provided and headers.get(b"x-api-key"):
+            provided = headers[b"x-api-key"].decode("latin-1")
+        if not provided and scope.get("query_string"):
+            from urllib.parse import parse_qs
+
+            provided = parse_qs(scope["query_string"].decode("latin-1")).get(
+                "access_token", [""]
+            )[0]
+        return bool(provided) and hmac.compare_digest(provided, self.token)
+
+
+def build_http_app(transport, host, path, json_response, stateless, token):
+    if transport == "sse":
+        app = mcp.sse_app(host=host)
+    else:
+        app = mcp.streamable_http_app(
+            streamable_http_path=path,
+            json_response=json_response,
+            stateless_http=stateless,
+            host=host,
+        )
+    return AccessGuard(app, token)
+
+
+def main():
     transport = os.getenv("MCP_TRANSPORT", "streamable-http").strip().lower()
     host = os.getenv("MCP_HOST", "127.0.0.1")
-    port = int(os.getenv("MCP_PORT", "8000"))
+    path = os.getenv("MCP_PATH", "/mcp")
+    try:
+        port = int(os.getenv("MCP_PORT", "8000"))
+    except ValueError:
+        raise SystemExit("MCP_PORT must be an integer") from None
+    if transport not in ("stdio", "sse", "streamable-http"):
+        raise SystemExit(f"Unsupported MCP_TRANSPORT: {transport}")
+    auth_enabled = _env_flag("MCP_AUTH_ENABLED")
+    token = os.getenv("MCP_AUTH_TOKEN") if auth_enabled else None
+    if auth_enabled and not token:
+        raise SystemExit("MCP_AUTH_ENABLED=1 requires MCP_AUTH_TOKEN")
     if transport == "stdio":
         mcp.run(transport="stdio")
-    elif transport == "sse":
-        mcp.run(transport="sse", host=host, port=port)
-    elif transport == "streamable-http":
-        mcp.run(
-            transport="streamable-http",
-            host=host,
-            port=port,
-            streamable_http_path=os.getenv("MCP_PATH", "/mcp"),
-            json_response=_env_flag("MCP_JSON_RESPONSE"),
-            stateless_http=_env_flag("MCP_STATELESS"),
-        )
-    else:
-        raise SystemExit(f"Unsupported MCP_TRANSPORT: {transport}")
+        return
+    if _env_flag("MCP_PRELOAD_MODEL"):
+        threading.Thread(target=warm_model, daemon=True).start()
+    app = build_http_app(
+        transport,
+        host,
+        path,
+        _env_flag("MCP_JSON_RESPONSE"),
+        _env_flag("MCP_STATELESS"),
+        token,
+    )
+    import uvicorn
+
+    uvicorn.run(app, host=host, port=port, log_level="info")
+
+
+if __name__ == "__main__":
+    main()

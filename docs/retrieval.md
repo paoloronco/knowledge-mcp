@@ -50,11 +50,32 @@ The server speaks MCP Streamable HTTP at `/mcp`, which all current MCP clients (
 | `MCP_STATELESS` | `0` | Set to `1` for stateless requests behind load balancers or authenticated proxies that do not preserve session IDs |
 | `MCP_JSON_RESPONSE` | `0` | Set to `1` to return plain JSON instead of an SSE response stream for simple clients |
 | `MCP_HOST` / `MCP_PORT` | `127.0.0.1` / `8000` | Bind address (the image sets `0.0.0.0`) |
+| `MCP_AUTH_ENABLED` / `MCP_AUTH_TOKEN` | `0` / — | Optional bearer-token auth (see [Access control](access-control.md)) |
+| `MCP_PRELOAD_MODEL` | `0` | Warm the embedding model at startup |
+| `ACL_DENY_DIRECTORIES` | empty | Comma-separated denied directory names |
+| `LEXICAL_BIGRAMS` | `0` | Phrase-matching bigrams (re-index after changing) |
 
-The endpoint has no built-in HTTP authentication; put an authenticated proxy or [Cloudflare Access](cloudflare-access.md) in front of it before remote use. `knowledge_status` lets a client confirm the index is available before relying on search results.
+The endpoint has no built-in HTTP authentication by default; enable
+`MCP_AUTH_ENABLED` in Settings or put an authenticated proxy / [Cloudflare Access](cloudflare-access.md)
+in front of it before remote use. `GET /healthz` is an unauthenticated liveness
+endpoint. `knowledge_status` lets a client confirm the index is available before
+relying on search results.
+
+## Recent additions (response metadata and navigation)
+
+Chunks returned by `search`, `browse` and `read` now carry additive metadata:
+`section_path` (heading breadcrumb for Markdown/HTML), `title`, `parent_dir`,
+`language`, `char_count`. These are new keys; existing fields are unchanged.
+`browse_private_knowledge` additionally returns a `folders` list of immediate
+subfolders under `path_prefix`, so a client can walk the indexed library.
+
+The per-request migration check is cached by collection fingerprint, so the
+exact legacy count no longer runs on every query. See [Changes](changes.md) and
+[Operations](operations.md) for details. An optional `LEXICAL_BIGRAMS` flag
+adds phrase-matching terms to the sparse index (re-index after toggling).
 
 ## Verification
 
-From the repository root, run `python -m unittest discover -s tests -p 'test_*.py'` and `node --test tests/test_dashboard.js` with the service dependencies installed. `test_mcp_protocol.py` exercises Streamable HTTP initialization, tool schemas, search, browse, document pagination and invalid paths through an SDK client.
+From the repository root, run `python -m unittest discover -s tests -q` and `node --test tests/test_dashboard.js` with the service dependencies installed. `test_mcp_protocol.py` exercises Streamable HTTP initialization, tool listing, search, browse, document pagination and invalid paths through an SDK client; `test_access.py` covers auth, ACL and server configuration.
 
 Set `KNOWLEDGE_TEST_REAL_MODEL=1` to run the protocol test with the locally cached E5 small model. Set `KNOWLEDGE_SCALE_DOCUMENTS=10000` when running `test_retrieval.py` to exercise bounded candidate retrieval on 10,000 synthetic documents. These tests use Qdrant's local engine; they verify correctness and request bounds, not production server latency, GPU throughput or recall on a private corpus.

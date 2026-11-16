@@ -335,6 +335,12 @@ The AI client can use `browse_private_knowledge` to discover documents, `search_
 
 ## Documentation
 
+- [Documentation index](docs/README.md)
+- [Configuration](docs/configuration.md): config keys, environment variables
+- [Access control](docs/access-control.md): optional MCP auth, allowed roots, denied directories
+- [Operations](docs/operations.md): health, readiness, logs, restarts
+- [Changes](docs/changes.md): what changed in the latest iteration
+- [Verification](docs/verification.md): test commands and coverage
 - [Docker deployment, updates, and migration](docs/docker.md)
 - [Self-update](docs/self-update.md)
 - [Architecture](docs/architecture.md)
