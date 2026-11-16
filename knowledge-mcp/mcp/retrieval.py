@@ -19,7 +19,11 @@ from index_schema import (
     sparse_vector,
     tokens,
 )
-from policy_defaults import DEFAULT_POLICY, ensure_required_exclusions
+from policy_defaults import (
+    DEFAULT_POLICY,
+    ensure_required_exclusions,
+    remove_legacy_default_exclusions,
+)
 from redaction import redact_secrets
 
 QDRANT_URL = os.getenv("QDRANT_URL", "http://127.0.0.1:6333")
@@ -68,6 +72,7 @@ def load_policy():
             if POLICY_FILE.exists()
             else dict(DEFAULT_POLICY)
         )
+        remove_legacy_default_exclusions(policy)
         ensure_required_exclusions(policy)
         _policy_cache = policy
         _policy_stamp = stamp
@@ -106,16 +111,25 @@ def source_allowed(source, policy):
     if path.is_absolute() or ".." in path.parts:
         return False
     parts = [part.casefold() for part in path.parts]
-    excluded = {name.casefold() for name in policy.get("exclude_files", [])}
+    directories = set(parts[:-1])
+    excluded = {name.casefold() for name in (policy.get("exclude_files") or [])}
+    excluded_directories = {
+        name.casefold() for name in (policy.get("exclude_directories") or [])
+    }
+    excluded_top_level = {
+        name.casefold() for name in (policy.get("exclude_top_level") or [])
+    }
+    included = {name.casefold() for name in (policy.get("include_extensions") or [])}
+    excluded_extensions = {
+        name.casefold() for name in (policy.get("exclude_extensions") or [])
+    }
     return (
-        parts[0] not in {name.casefold() for name in policy["exclude_top_level"]}
-        and not set(parts[:-1]).intersection(
-            name.casefold() for name in policy["exclude_directories"]
-        )
+        not directories.intersection(excluded_top_level)
+        and not directories.intersection(excluded_directories)
         and path.name.casefold() not in excluded
         and path.as_posix().casefold() not in excluded
-        and path.suffix.lower() in policy["include_extensions"]
-        and path.suffix.lower() not in policy["exclude_extensions"]
+        and path.suffix.lower() in included
+        and path.suffix.lower() not in excluded_extensions
     )
 
 
@@ -169,46 +183,70 @@ def query_filter(policy, include_historical=False, path_prefix="", source=""):
         condition("embedding_model", MODEL_NAME),
     ]
     must_not = []
-    for field, values in (
-        ("directories", policy["exclude_directories"]),
-        ("source_top_level", policy["exclude_top_level"]),
-    ):
-        if values:
-            must_not.append(
-                models.FieldCondition(
-                    key=field, match=models.MatchAny(any=[v.casefold() for v in values])
-                )
+    excluded_directories = [v.casefold() for v in (policy.get("exclude_directories") or [])]
+    excluded_top_level = [v.casefold() for v in (policy.get("exclude_top_level") or [])]
+    directory_exclusions = sorted(set(excluded_directories) | set(excluded_top_level))
+    if directory_exclusions:
+        must_not.append(
+            models.FieldCondition(
+                key="directories", match=models.MatchAny(any=directory_exclusions)
             )
+        )
+    if excluded_top_level:
+        must_not.append(
+            models.FieldCondition(
+                key="source_top_level", match=models.MatchAny(any=excluded_top_level)
+            )
+        )
     if not include_historical:
         must_not.append(condition("lifecycle", "historical"))
     if path_prefix:
-        must.append(condition("source_prefixes", validate_path(path_prefix)))
+        prefix = validate_path(path_prefix)
+        must.append(
+            models.Filter(
+                should=[
+                    condition("source_prefixes", prefix),
+                    condition("source_prefixes_casefold", prefix.casefold()),
+                ]
+            )
+        )
         folder = PurePosixPath(path_prefix)
         if set(part.casefold() for part in folder.parts).intersection(
-            name.casefold() for name in policy["exclude_directories"]
-        ) or folder.parts[0].casefold() in {
-            name.casefold() for name in policy["exclude_top_level"]
-        }:
+            set(excluded_directories) | set(excluded_top_level)
+        ) or folder.parts[0].casefold() in set(excluded_top_level):
             must.append(condition("document_id", "excluded"))
     if source:
-        must.append(condition("source_paths", validate_path(source)))
+        exact = validate_path(source)
+        must.append(
+            models.Filter(
+                should=[
+                    condition("source_paths", exact),
+                    condition("source_paths_casefold", exact.casefold()),
+                ]
+            )
+        )
         if not source_allowed(source, policy):
             must.append(condition("document_id", "excluded"))
-    must.append(
-        models.FieldCondition(
-            key="extension", match=models.MatchAny(any=policy["include_extensions"])
+    included = policy.get("include_extensions") or []
+    if included:
+        must.append(
+            models.FieldCondition(
+                key="extension", match=models.MatchAny(any=included)
+            )
         )
-    )
-    if policy["exclude_extensions"]:
+    else:
+        must.append(condition("document_id", "excluded"))
+    excluded_extensions = policy.get("exclude_extensions") or []
+    if excluded_extensions:
         must_not.append(
             models.FieldCondition(
-                key="extension", match=models.MatchAny(any=policy["exclude_extensions"])
+                key="extension", match=models.MatchAny(any=excluded_extensions)
             )
         )
     for field, paths in (("source_casefold", True), ("filename_casefold", False)):
         values = [
             value.casefold()
-            for value in policy.get("exclude_files", [])
+            for value in (policy.get("exclude_files") or [])
             if ("/" in value) == paths
         ]
         if values:
@@ -410,20 +448,24 @@ def browse_documents(path_prefix="", limit=30, cursor=None, include_historical=F
 
 def expand_result_context(item, include_historical=False):
     payload = item.get("payload") or {}
+    unchanged = {
+        "text": payload.get("text", ""),
+        "expanded": False,
+        "expansion_mode": "none",
+        "expanded_chunks": 1,
+    }
+    document_id = payload.get("document_id")
+    if not document_id:
+        return unchanged
     start = max(0, payload.get("document_order", 0) - 1)
-    result = read_document(payload["document_id"], start, 3, include_historical)
+    result = read_document(document_id, start, 3, include_historical)
     chunks = [
         chunk
-        for chunk in result["chunks"]
+        for chunk in result.get("chunks", [])
         if chunk["section_index"] == payload.get("section_index")
     ]
     if not chunks:
-        return {
-            "text": payload.get("text", ""),
-            "expanded": False,
-            "expansion_mode": "none",
-            "expanded_chunks": 1,
-        }
+        return unchanged
     text = "\n\n".join(chunk["text"] for chunk in chunks)
     return {
         "text": text[:MAX_CONTEXT_CHARS],
@@ -475,14 +517,25 @@ def search(
     needs_update = collection_needs_update(info)
     lexical_available = LEXICAL_VECTOR in (info.config.params.sparse_vectors or {})
     global model
-    with _model_lock:
-        if model is None:
-            from sentence_transformers import SentenceTransformer
+    current_model = model
+    if current_model is None:
+        with _model_lock:
+            if model is None:
+                try:
+                    from sentence_transformers import SentenceTransformer
 
-            model = SentenceTransformer(MODEL_NAME, device=embedding_device())
-        vector = model.encode(
+                    model = SentenceTransformer(MODEL_NAME, device=embedding_device())
+                except Exception as exc:
+                    return backend_failure(
+                        exc, query=query, results=[], result_count=0
+                    )
+            current_model = model
+    try:
+        vector = current_model.encode(
             [query_text(MODEL_NAME, query)], normalize_embeddings=True
         )[0].tolist()
+    except Exception as exc:
+        return backend_failure(exc, query=query, results=[], result_count=0)
     try:
         dense_groups = client.query_points_groups(
             DENSE_COLLECTION,

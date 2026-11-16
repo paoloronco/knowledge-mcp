@@ -6,13 +6,26 @@ const setupLabels = ['Dashboard login', 'Service health', 'Document folders', 'I
 const setupPaths = ['/setup/login', '/setup/health', '/setup/folders', '/setup/policy', '/setup/eligible', '/setup/dry-run', '/setup/indexing'];
 const dashboardPages = ['overview', 'indexing', 'folders', 'policy', 'settings'];
 
+let pendingActions = 0;
+function renderBusy() {
+  const el = $('global-busy');
+  if (!el) return;
+  el.classList.toggle('hidden', pendingActions === 0);
+  el.setAttribute('aria-busy', pendingActions ? 'true' : 'false');
+}
 async function api(path, data) {
-  const options = data === undefined ? {} : {
-    method: 'POST', headers: {'Content-Type': 'application/json', 'X-Control-Token': token}, body: JSON.stringify(data)
-  };
-  const response = await fetch(path, options), body = await response.json();
-  if (!response.ok) throw Error(body.error || 'Request failed');
-  return body;
+  const post = data !== undefined;
+  if (post) { pendingActions++; renderBusy(); }
+  try {
+    const options = post ? {
+      method: 'POST', headers: {'Content-Type': 'application/json', 'X-Control-Token': token}, body: JSON.stringify(data)
+    } : {};
+    const response = await fetch(path, options), body = await response.json();
+    if (!response.ok) throw Error(body.error || 'Request failed');
+    return body;
+  } finally {
+    if (post) { pendingActions--; renderBusy(); }
+  }
 }
 async function downloadBackup() {
   $('backup-download').disabled = true;
@@ -518,11 +531,59 @@ function syncProgressDetail(s) {
   if (progress.phase === 'finalizing') return ': finalizing';
   return '';
 }
+function renderReadiness(s) {
+  const banner = $('service-banner'), r = s.readiness;
+  banner.classList.toggle('hidden', !r);
+  if (!r) return;
+  for (const tone of ['ready', 'busy', 'warning']) banner.classList.toggle('service-banner-' + tone, r.tone === tone);
+  banner.classList.toggle('spinning', Boolean(r.spinner));
+  $('service-banner-mark').textContent = r.tone === 'ready' ? 'OK' : r.tone === 'warning' ? '!' : '…';
+  $('service-banner-title').textContent = r.title || '';
+  $('service-banner-detail').textContent = r.detail || '';
+  const labels = {done: 'ready', active: 'in progress', pending: 'waiting', error: 'error'};
+  $('service-banner-steps').textContent = (r.steps || []).map(x => x.label + ': ' + (labels[x.state] || x.state)).join('  ·  ');
+  const action = r.action, button = $('service-banner-action');
+  button.classList.toggle('hidden', !action);
+  if (action) { button.textContent = action.label; button.onclick = () => readinessAction(action.kind); }
+}
+function readinessAction(kind) {
+  if (kind === 'start_qdrant' || kind === 'start_mcp') service(kind === 'start_qdrant' ? 'qdrant' : 'mcp', 'start');
+  else if (kind === 'open_indexing') goDashboardPage('indexing', true);
+  else if (kind === 'open_folders') goDashboardPage('folders', true);
+}
+function renderConnection(s) {
+  const port = s.mcp_port || 8000;
+  const host = (typeof location !== 'undefined' && location.hostname) || 'HOST_IP';
+  const origin = (typeof location !== 'undefined' && location.origin) || ('http://' + host + ':8080');
+  $('mcp-endpoint').value = 'http://' + host + ':' + port + '/mcp';
+  $('dashboard-origin').textContent = origin;
+  $('app-version').textContent = s.version || '—';
+  $('update-command').value = 'bash scripts/self-update.sh';
+}
+function copyText(id, label) {
+  const el = $(id), text = el.value || '';
+  const done = () => { $('connection-status').textContent = label + ' copied to clipboard.'; };
+  if (typeof navigator !== 'undefined' && navigator.clipboard && navigator.clipboard.writeText) {
+    navigator.clipboard.writeText(text).then(done, () => fallbackCopy(el, done));
+  } else fallbackCopy(el, done);
+}
+function fallbackCopy(el, done) {
+  try {
+    el.removeAttribute('readonly'); el.select();
+    if (document.execCommand && document.execCommand('copy')) done();
+    else $('connection-status').textContent = 'Select the text above and copy it manually.';
+    el.setAttribute('readonly', 'readonly');
+  } catch (e) { $('connection-status').textContent = 'Select the text above and copy it manually.'; }
+}
+function copyEndpoint() { copyText('mcp-endpoint', 'Endpoint'); }
+function copyUpdate() { copyText('update-command', 'Update command'); }
 async function refresh() {
   if (refreshing) return;
   refreshing = true;
   try {
     const s = await api('/api/status'); current = s;
+    renderConnection(s);
+    renderReadiness(s);
     renderEmbeddingModels(s);
     syncRoute(s);
     renderSetupProgress(s);
@@ -585,7 +646,9 @@ async function refresh() {
 }
 async function start() {
   try {
-    const auth = await api('/api/auth'); if (!auth.authenticated) { $('login-view').classList.remove('hidden'); return; }
+    const auth = await api('/api/auth');
+    $('boot-view').classList.add('hidden');
+    if (!auth.authenticated) { $('login-view').classList.remove('hidden'); return; }
     authRequired = auth.required;
     $('app-view').classList.remove('hidden'); $('logout').classList.toggle('hidden', !auth.required);
     $('auth-state').textContent = auth.required ? 'Login enabled' : 'Login disabled';
@@ -597,7 +660,12 @@ async function start() {
     $('interval').value = current.config.interval_hours;
     await loadPolicy();
     syncRoute(current); await refresh(); setInterval(refresh, 3000);
-  } catch (e) { message(e.message, true); }
+  } catch (e) {
+    $('boot-view').classList.remove('hidden');
+    $('boot-status').textContent = 'The service is starting or temporarily unreachable. Retrying automatically…';
+    message(e.message, true);
+    setTimeout(start, 3000);
+  }
 }
 if (typeof window !== 'undefined') {
   window.addEventListener('popstate', () => { if (current) syncRoute(current); });

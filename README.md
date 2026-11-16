@@ -29,6 +29,8 @@ Replace `HOST_IP` with the IP address or hostname of the machine running Docker.
 | MCP | `http://HOST_IP:8000/mcp` | Connect an MCP-compatible client after indexing and starting MCP |
 | Qdrant | `127.0.0.1:6333` inside the app container | Internal vector database; no host port is published |
 
+The MCP endpoint uses standard Streamable HTTP at `/mcp`, so it works with Claude, ChatGPT, Cursor, VS Code, Gemini CLI and SDK-based clients. Legacy SSE and local stdio transports, plus stateless and plain-JSON modes for authenticated proxies, are available through `MCP_TRANSPORT`, `MCP_STATELESS` and `MCP_JSON_RESPONSE`. See [MCP client compatibility](docs/retrieval.md#mcp-client-compatibility).
+
 ## Docker image
 
 The commands below use Docker Engine on a **Linux host or NAS**. Start the app first, then its companion.
@@ -176,6 +178,30 @@ If a document fails, fix its source or use **Ignore this file**, then retry the 
 
 ## Update without losing data
 
+### One-command self-update (recommended)
+
+From a checkout of this repository, run on the Docker host:
+
+```bash
+bash scripts/self-update.sh
+```
+
+It pulls the newest image, recreates `knowledge-mcp` and, when installed,
+`knowledge-mcp-host-agent` automatically, and verifies the app is healthy before
+finishing. On failure it restores the previous image. Named volumes are kept, so
+settings, documents and indexes survive. Compose installs are detected and
+updated with `docker compose pull && docker compose up -d`. See
+[self-update](docs/self-update.md) for options such as `--dry-run`, `--tag` and
+custom container names.
+
+Compose users can also run the equivalent directly:
+
+```bash
+docker compose pull && docker compose up -d
+```
+
+### Manual update
+
 For the `docker run` installation above:
 
 1. Pull the CPU/companion image:
@@ -309,6 +335,7 @@ The AI client can use `browse_private_knowledge` to discover documents, `search_
 ## Documentation
 
 - [Docker deployment, updates, and migration](docs/docker.md)
+- [Self-update](docs/self-update.md)
 - [Architecture](docs/architecture.md)
 - [Retrieval behavior](docs/retrieval.md)
 - [Security model](docs/security-model.md)

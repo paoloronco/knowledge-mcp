@@ -65,12 +65,15 @@ def source_metadata(source, duplicate_sources=()):
         prefixes.update(
             PurePosixPath(*parts[:end]).as_posix() for end in range(1, len(parts))
         )
+    paths = [source, *duplicate_sources]
     return {
         "index_version": INDEX_VERSION,
         "directories": directories,
         "source_top_level": path.parts[0].casefold(),
         "source_prefixes": sorted(prefixes),
-        "source_paths": [source, *duplicate_sources],
+        "source_paths": paths,
+        "source_prefixes_casefold": sorted({prefix.casefold() for prefix in prefixes}),
+        "source_paths_casefold": [name.casefold() for name in paths],
         "lifecycle": "historical"
         if HISTORICAL_DIRECTORIES.intersection(directories)
         else "current_or_unknown",
@@ -97,6 +100,8 @@ def ensure_search_schema(client, collection):
         "extension": models.PayloadSchemaType.KEYWORD,
         "source_prefixes": models.PayloadSchemaType.KEYWORD,
         "source_paths": models.PayloadSchemaType.KEYWORD,
+        "source_prefixes_casefold": models.PayloadSchemaType.KEYWORD,
+        "source_paths_casefold": models.PayloadSchemaType.KEYWORD,
         "source_top_level": models.PayloadSchemaType.KEYWORD,
         "directories": models.PayloadSchemaType.KEYWORD,
         "lifecycle": models.PayloadSchemaType.KEYWORD,

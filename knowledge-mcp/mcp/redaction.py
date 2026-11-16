@@ -27,18 +27,26 @@ def redact_secrets(text):
 
     # Assignment-style credentials.
     # Examples: QDRANT_API_KEY=x, password: x, export TOKEN=x.
-    assignment_pattern = (
-        r"(?im)^(\s*(?:export\s+)?[`\"\']?"
-        r"[A-Za-z0-9_.-]*(?:password|passwd|pwd|psw|api[_ -]?key|apikey|"
+    credential_name = (
+        r"(?:password|passwd|pwd|psw|api[_ -]?key|apikey|"
         r"client[_ -]?secret|access[_ -]?token|refresh[_ -]?token|"
         r"auth[_ -]?token|bearer[_ -]?token|private[_ -]?key|secret|token)"
-        r"[A-Za-z0-9_.-]*[`\"\']?\s*[:=]\s*)[^\r\n]+"
+    )
+    assignment_pattern = (
+        r"(?im)^(\s*(?:export\s+)?[`\"\']?"
+        r"[A-Za-z0-9_.-]*?" + credential_name + r"[`\"\']?\s*[:=]\s*)[^\r\n]+"
     )
     value = re.sub(
         assignment_pattern,
         r"\1[REDACTED]",
         value,
     )
+
+    inline_pattern = (
+        r"(?i)([`\"']?" + credential_name + r"[`\"']?\s*[:=]\s*)"
+        r"(?!\[REDACTED)(?:[`\"'][^`\"'\r\n]{4,}[`\"']|[^\s,;}\]`\"'\r\n]{4,})"
+    )
+    value = re.sub(inline_pattern, r"\1[REDACTED]", value)
 
     # Label-style credentials.
     value = re.sub(
@@ -84,8 +92,9 @@ def redact_secrets(text):
 
     # Credentials embedded in URLs.
     value = re.sub(
-        r"(?i)\b(https?|mongodb(?:\+srv)?|postgres(?:ql)?|mysql)://([^/\s:@]+):([^@\s/]+)@",
-        r"\1://\2:[REDACTED]@",
+        r"(?i)\b((?:https?|mongodb(?:\+srv)?|postgres(?:ql)?|mysql|redis|rediss|"
+        r"amqp|amqps|ftp|sftp|smtp|smtps|ldap|ldaps)://)[^\s/@:]+:[^@\s/]*@",
+        r"\1[REDACTED]@",
         value,
     )
 

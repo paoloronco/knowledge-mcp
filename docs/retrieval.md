@@ -35,7 +35,21 @@ Run an incremental update after installing this version. It adds the sparse vect
 
 The state records a pipeline signature, so changing the model or chunk size invalidates old chunk layouts. Embeddings are computed and uploaded in bounded batches. A document becomes searchable only after all its batches have been acknowledged and its source has remained stable. Previous layouts are removed after successful replacement. A failed replacement preserves the last usable version; deleted documents are still pruned when discovery and hashing completed, even if a different document failed parsing. A limited run never prunes.
 
-State updates use an append-only recovery journal, compacted into the JSON checkpoint at the end of a run. A single-writer lock protects the state. Unchanged files reuse checksums when size, timestamps and identity agree; `--verify-hashes` forces a complete content verification. On filesystems that preserve all metadata during edits, use full verification. Source and destination host synchronization caches use the same metadata checks and are cleared on restart; a manually requested host sync forces source rehashing.
+State updates use an append-only recovery journal, compacted into the JSON checkpoint at the end of a run. A single-writer lock protects the state. Unchanged files reuse checksums when size, timestamps and identity agree; `--verify-hashes` forces a complete content verification. On filesystems that preserve all metadata during edits, use full verification. Source and destination host synchronization caches use the same metadata checks and are cleared on restart; a manually requested host sync forces source rehashing. A hashing failure keeps the last usable copy of only the affected sources; documents genuinely removed from the library are still pruned.
+
+## MCP client compatibility
+
+The server speaks MCP Streamable HTTP at `/mcp`, which all current MCP clients (Claude, ChatGPT, Cursor, VS Code, Gemini CLI, and SDK-based agents) support. It is exposed by the dashboard-managed MCP process on `MCP_PORT` (default `8000`). Optional environment variables adapt it to less common setups:
+
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `MCP_TRANSPORT` | `streamable-http` | `streamable-http`, `sse` (legacy clients at `/sse`), or `stdio` (local desktop clients running the image with `docker run -i`) |
+| `MCP_PATH` | `/mcp` | Streamable HTTP endpoint path |
+| `MCP_STATELESS` | `0` | Set to `1` for stateless requests behind load balancers or authenticated proxies that do not preserve session IDs |
+| `MCP_JSON_RESPONSE` | `0` | Set to `1` to return plain JSON instead of an SSE response stream for simple clients |
+| `MCP_HOST` / `MCP_PORT` | `127.0.0.1` / `8000` | Bind address (the image sets `0.0.0.0`) |
+
+The endpoint has no built-in HTTP authentication; put an authenticated proxy or [Cloudflare Access](cloudflare-access.md) in front of it before remote use. `knowledge_status` lets a client confirm the index is available before relying on search results.
 
 ## Verification
 

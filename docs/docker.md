@@ -14,9 +14,9 @@ For an NVIDIA GPU, install the [NVIDIA Container Toolkit](https://docs.nvidia.co
 docker compose up -d
 ```
 
-The app stores Qdrant data at `/qdrant/storage`. Settings, ingestion state, the model cache, and synchronized documents are under `/data`. A third volume retains the agent connection. To update, run `docker compose pull` followed by `docker compose up -d`. To stop the services, run `docker compose stop`.
+The app stores Qdrant data at `/qdrant/storage`. Settings, ingestion state, the model cache, and synchronized documents are under `/data`. A third volume retains the agent connection. To update, run `bash scripts/self-update.sh` from the repository checkout (it delegates to `docker compose pull` and `docker compose up -d` here), or run those two Compose commands directly. To stop the services, run `docker compose stop`.
 
-For the README's `docker run` installation, update by stopping and removing the host agent first, then the app container; pull the new image and repeat both README commands. Keep the three named volumes. Recreate the agent whenever you recreate the app container because it joins the app container's network namespace.
+For the README's `docker run` installation, `bash scripts/self-update.sh` inspects both containers and recreates them with the same volumes, ports, environment, GPU reservation and network, with an automatic rollback if the app does not become healthy. See [self-update](self-update.md). The manual equivalent is to stop and remove the host agent first, then the app container; pull the new image and repeat both README commands. Keep the three named volumes. Recreate the agent whenever you recreate the app container because it joins the app container's network namespace.
 
 Keep the same Compose project name and volume mappings when updating. Do not use `docker compose down -v` or delete/prune the application's volumes: that removes the saved data.
 

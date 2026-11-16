@@ -146,9 +146,29 @@ def read_private_document(
     return read_document(document_id, start_chunk, limit, include_historical)
 
 
+def _env_flag(name, default=False):
+    value = os.getenv(name)
+    if value is None:
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
 if __name__ == "__main__":
-    mcp.run(
-        transport="streamable-http",
-        host=os.getenv("MCP_HOST", "127.0.0.1"),
-        port=int(os.getenv("MCP_PORT", "8000")),
-    )
+    transport = os.getenv("MCP_TRANSPORT", "streamable-http").strip().lower()
+    host = os.getenv("MCP_HOST", "127.0.0.1")
+    port = int(os.getenv("MCP_PORT", "8000"))
+    if transport == "stdio":
+        mcp.run(transport="stdio")
+    elif transport == "sse":
+        mcp.run(transport="sse", host=host, port=port)
+    elif transport == "streamable-http":
+        mcp.run(
+            transport="streamable-http",
+            host=host,
+            port=port,
+            streamable_http_path=os.getenv("MCP_PATH", "/mcp"),
+            json_response=_env_flag("MCP_JSON_RESPONSE"),
+            stateless_http=_env_flag("MCP_STATELESS"),
+        )
+    else:
+        raise SystemExit(f"Unsupported MCP_TRANSPORT: {transport}")

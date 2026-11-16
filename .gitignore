@@ -255,3 +255,8 @@ deployment-scripts/
 !knowledge-mcp/.dockerignore
 Dockerfile.local
 docker-compose.override.yml
+
+# Self-update tooling is committed intentionally (the generic *.sh rule above is
+# meant for generated local deployment scripts, not repository tooling).
+!scripts/
+!scripts/*.sh

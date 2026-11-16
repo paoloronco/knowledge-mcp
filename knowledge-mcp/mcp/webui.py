@@ -35,6 +35,7 @@ from policy_defaults import (
 )
 from backup import MAX_UNPACKED_SIZE, create_backup, stage_restore, apply_restore
 from retrieval import invalidate_policy_cache
+from app_version import __version__ as APP_VERSION
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -238,6 +239,7 @@ class Controller:
         self.stopping = False
         self.restart_requested = False
         self.maintenance = False
+        self.started_at = time.time()
         self.active_uploads = 0
         self.backup_download = None
         self.qdrant = None
@@ -1091,14 +1093,130 @@ class Controller:
             entry["ignored"] = entry["source"].casefold() in excluded
         return entries, origin
 
+    def _readiness(self, status):
+        """Describe, in plain language, what the deployment is doing right now."""
+        config = status["config"]
+        onboarding = bool(config["onboarding_complete"])
+        qdrant = bool(status["qdrant_ready"])
+        mcp = bool(status["mcp_running"])
+        documents = bool(status["source_ready"])
+        indexing = bool(status["index_running"])
+        syncing = bool(status["agent_syncing"]) or (
+            config["source_mode"] == "host_agent" and bool(status["scan_running"])
+        )
+        maintenance = bool(status["maintenance"])
+        uptime = status["uptime_seconds"]
+        last = status["last_result"]
+        index_ready = bool(config.get("active_embedding_model")) or bool(
+            last and not last["dry_run"] and last["exit_code"] == 0
+        )
+        progress = status["index_progress"] or {}
+        stages = {
+            "discovering": "Discovering eligible documents",
+            "hashing": "Checking documents for changes",
+            "dry_run": "Testing document parsing",
+            "loading_model": "Loading the embedding model",
+            "indexing": "Indexing documents",
+        }
+        stage = stages.get(progress.get("stage"), "Preparing")
+        total = progress.get("total")
+        completed = progress.get("completed") or 0
+        agent_progress = status["agent_progress"] or {}
+        sync_detail = ""
+        if agent_progress.get("phase") == "transferring" and agent_progress.get("total"):
+            sync_detail = (
+                f" {agent_progress.get('completed', 0)} of {agent_progress['total']} files transferred."
+            )
+        elif agent_progress.get("checked"):
+            sync_detail = f" {agent_progress['checked']} files checked so far."
+
+        steps = [
+            {"label": "Database", "state": "done" if qdrant else "active"},
+            {"label": "Documents", "state": "done" if documents else ("active" if syncing else "pending")},
+            {"label": "Search index", "state": "done" if index_ready else ("active" if indexing else "pending")},
+            {"label": "MCP server", "state": "done" if mcp else "pending"},
+        ]
+
+        if maintenance:
+            phase, title = "maintenance", "Maintenance in progress"
+            detail = "A backup or restore is running. Other actions are paused and search is temporarily unavailable. This usually takes a few minutes."
+            action = None
+        elif not qdrant:
+            if uptime < 180:
+                phase, title = "starting", "Starting up"
+                detail = (
+                    "The vector database is warming up. This is normal just after a deploy or "
+                    "restart: the dashboard is available, but search is not ready yet."
+                )
+            else:
+                phase, title = "degraded", "Database unavailable"
+                detail = "Qdrant is not responding. Check Service health below and start or restart it."
+            action = {"label": "Start Qdrant", "kind": "start_qdrant"} if status["qdrant_managed"] else None
+        elif indexing:
+            phase, title = "indexing", "Building the search index"
+            detail = (
+                f"{stage}: {completed} of {total} documents. Search becomes available when indexing finishes."
+                if total
+                else f"{stage}. Search becomes available when indexing finishes."
+            )
+            action = {"label": "View progress", "kind": "open_indexing"}
+        elif syncing:
+            phase, title = "syncing", "Synchronizing documents"
+            detail = "Eligible documents are being copied into the app. Indexing can follow once the sync completes." + sync_detail
+            action = {"label": "Open folders", "kind": "open_folders"}
+        elif not onboarding:
+            phase, title = "setup", "Setup in progress"
+            detail = (
+                "Complete the steps below to select folders, scan documents and run the first "
+                "index. The MCP server is not available until indexing finishes."
+            )
+            action = None
+        elif not mcp:
+            phase, title = "mcp_stopped", "MCP server is stopped"
+            detail = (
+                "Start the MCP server from Dashboard → MCP server, then connect your AI client "
+                "to the endpoint shown in Settings."
+            )
+            action = {"label": "Start MCP server", "kind": "start_mcp"}
+        elif not documents:
+            phase, title = "documents_missing", "Documents are not available"
+            detail = "The selected folder is not reachable yet. Review Document folders and run a sync or scan."
+            action = {"label": "Open folders", "kind": "open_folders"}
+        else:
+            phase, title = "ready", "Ready"
+            detail = "Your documents are indexed and searchable. Connect an AI client to the MCP endpoint shown in Settings."
+            action = None
+
+        tone = (
+            "ready"
+            if phase == "ready"
+            else "busy"
+            if phase in {"starting", "indexing", "syncing", "maintenance"}
+            else "warning"
+        )
+        return {
+            "phase": phase,
+            "title": title,
+            "detail": detail,
+            "ready": phase == "ready",
+            "tone": tone,
+            "spinner": tone == "busy",
+            "steps": steps,
+            "action": action,
+        }
+
     def status(self):
+        try:
+            mcp_port = int(os.getenv("MCP_PORT", "8000"))
+        except ValueError:
+            mcp_port = 8000
         try:
             with urllib.request.urlopen(os.getenv("QDRANT_URL", "http://127.0.0.1:6333").rstrip("/") + "/readyz", timeout=1) as response:
                 qdrant = response.status == 200
         except Exception:
             qdrant = False
         try:
-            with socket.create_connection(("127.0.0.1", int(os.getenv("MCP_PORT", "8000"))), timeout=0.5):
+            with socket.create_connection(("127.0.0.1", mcp_port), timeout=0.5):
                 mcp_reachable = True
         except OSError:
             mcp_reachable = False
@@ -1138,8 +1256,12 @@ class Controller:
                     output.seek(max(0, output.tell() - 12000))
                     tail = output.read().decode("utf-8", errors="replace")
             index_errors, error_origin = self.index_errors()
-            return {
+            result = {
                 "config": dict(self.config),
+                "version": APP_VERSION,
+                "started_at": self.started_at,
+                "uptime_seconds": max(0, time.time() - self.started_at),
+                "mcp_port": mcp_port,
                 "embedding_models": MODELS,
                 "gpu": GPU_MONITOR.status(),
                 "embedding_device_preference": os.getenv("EMBEDDING_DEVICE", "auto"),
@@ -1180,6 +1302,8 @@ class Controller:
                 "next_run_at": self.config["last_run_at"] + self.config["interval_hours"] * 3600 if self.config["interval_hours"] else None,
                 "log": tail,
             }
+            result["readiness"] = self._readiness(result)
+            return result
 
     def host_source_ready(self):
         return bool(self.config["host_root"] and self.agent_manifest.get("revision") == self.config["sync_revision"] and self.agent_manifest.get("sync_request", -1) >= self.config["sync_request"] and not self.sync_in_progress and not self.agent_error_text and time.time() - self.agent_seen_at < 60)
@@ -1301,7 +1425,7 @@ class Handler(BaseHTTPRequestHandler):
             healthy = status["app_ready"] and (
                 status["qdrant_ready"] or maintenance
             )
-            self.send(200 if healthy else 503, json.dumps({"app_ready": status["app_ready"], "qdrant_ready": status["qdrant_ready"], "mcp_running": status["mcp_running"], "maintenance": maintenance}))
+            self.send(200 if healthy else 503, json.dumps({"app_ready": status["app_ready"], "qdrant_ready": status["qdrant_ready"], "mcp_running": status["mcp_running"], "maintenance": maintenance, "phase": status["readiness"]["phase"], "ready": status["readiness"]["ready"]}))
             return
         if self.path == "/" or self.path in SETUP_PATHS or self.path in DASHBOARD_PATHS:
             token = CONTROL_TOKEN if self._authenticated() else ""

@@ -58,15 +58,19 @@ def allowed_file(value, size, policy):
     path = relative_path(value)
     if is_office_lock_file(path.name):
         return False
-    if type(size) is not int or size < 1 or size > policy["max_file_size_mb"] * 1024 * 1024:
+    max_size = (policy.get("max_file_size_mb") or 50) * 1024 * 1024
+    if type(size) is not int or size < 1 or size > max_size:
         return False
     parts = path.parts
-    if parts[0].casefold() in {x.casefold() for x in policy["exclude_top_level"]}:
+    directories = {part.casefold() for part in parts[:-1]}
+    excluded_top = {x.casefold() for x in (policy.get("exclude_top_level") or [])}
+    excluded_dirs = {x.casefold() for x in (policy.get("exclude_directories") or [])}
+    if directories.intersection(excluded_top | excluded_dirs):
         return False
-    if any(x.casefold() in {y.casefold() for y in policy["exclude_directories"]} for x in parts[:-1]):
-        return False
-    excluded = {x.casefold() for x in policy.get("exclude_files", [])}
+    excluded = {x.casefold() for x in (policy.get("exclude_files") or [])}
     if path.name.casefold() in excluded or value.casefold() in excluded:
         return False
     suffix = path.suffix.lower()
-    return suffix in policy["include_extensions"] and suffix not in policy["exclude_extensions"]
+    included = {x.casefold() for x in (policy.get("include_extensions") or [])}
+    excluded_ext = {x.casefold() for x in (policy.get("exclude_extensions") or [])}
+    return suffix in included and suffix not in excluded_ext

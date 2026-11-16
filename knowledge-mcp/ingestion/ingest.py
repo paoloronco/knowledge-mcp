@@ -261,21 +261,16 @@ def is_candidate(path, root, policy):
 
     relative = path.relative_to(root)
 
-    # Top-level exclusions
-    if relative.parts:
-        excluded_top = {
-            name.casefold() for name in policy.get("exclude_top_level", [])
-        } | REQUIRED_TOP_LEVEL_NAMES
-
-        if relative.parts[0].casefold() in excluded_top:
-            return False
+    excluded_top = {
+        name.casefold() for name in (policy.get("exclude_top_level") or [])
+    } | REQUIRED_TOP_LEVEL_NAMES
 
     # Directory exclusions
     excluded_dirs = {
-        name.casefold() for name in policy.get("exclude_directories", [])
+        name.casefold() for name in (policy.get("exclude_directories") or [])
     } | REQUIRED_DIRECTORY_NAMES
 
-    if any(part.casefold() in excluded_dirs for part in relative.parts[:-1]):
+    if any(part.casefold() in excluded_dirs | excluded_top for part in relative.parts[:-1]):
         return False
 
     excluded_files = {name.casefold() for name in policy.get("exclude_files", [])}
@@ -325,8 +320,13 @@ def discover_documents(policy):
         or not all(isinstance(item, str) for item in selected)
     ):
         raise ValueError("INDEX_SOURCE_PATHS must contain selected folders")
-    excluded_dirs = {name.casefold() for name in policy["exclude_directories"]}
-    excluded_top = {name.casefold() for name in policy["exclude_top_level"]}
+    excluded_dirs = {
+        name.casefold() for name in (policy.get("exclude_directories") or [])
+    } | REQUIRED_DIRECTORY_NAMES
+    excluded_top = {
+        name.casefold() for name in (policy.get("exclude_top_level") or [])
+    } | REQUIRED_TOP_LEVEL_NAMES
+    restricted_dirs = excluded_dirs | excluded_top
 
     def unreadable(error):
         raise OSError(f"Document scan incomplete: {error}") from error
@@ -339,9 +339,7 @@ def discover_documents(policy):
         if not folder.is_relative_to(root) or not folder.is_dir():
             raise ValueError(f"Selected folder is outside the document library: {item}")
         relative = folder.relative_to(root)
-        if any(part.casefold() in excluded_dirs for part in relative.parts) or (
-            relative.parts and relative.parts[0].casefold() in excluded_top
-        ):
+        if any(part.casefold() in restricted_dirs for part in relative.parts):
             continue
         if any(folder.is_relative_to(previous) for previous in scanned):
             continue
@@ -351,9 +349,8 @@ def discover_documents(policy):
             dirs[:] = sorted(
                 name
                 for name in dirs
-                if name.casefold() not in excluded_dirs
+                if name.casefold() not in restricted_dirs
                 and not (current / name).is_symlink()
-                and (current != root or name.casefold() not in excluded_top)
             )
             for name in names:
                 path = current / name
@@ -761,6 +758,7 @@ def run_ingestion(args):
         )
     hash_to_paths, file_hashes = {}, {}
     hash_failures = 0
+    hash_failure_sources = set()
     for count, path in enumerate(tqdm(candidates), 1):
         try:
             relative = path.relative_to(root).as_posix()
@@ -782,6 +780,10 @@ def run_ingestion(args):
             file_hashes[document_id] = digest
         except Exception as exc:
             hash_failures += 1
+            try:
+                hash_failure_sources.add(path.relative_to(root).as_posix())
+            except ValueError:
+                pass
             log_error(path, exc, "hashing")
         write_progress("hashing", count, len(candidates))
     write_progress("hashing", len(candidates), len(candidates), force=True)
@@ -1054,14 +1056,15 @@ def run_ingestion(args):
         # Prune only after indexing: a source still present on disk always has a
         # new document_id, so removing the old version up front would discard the
         # last usable copy when the replacement fails to parse.
-        if args.limit is None and not hash_failures:
+        if args.limit is None:
+            protected_sources = failed_sources | hash_failure_sources
             for document_id in set(state["documents"]) - set(hash_to_paths):
                 entry = state["documents"][document_id]
                 entry_sources = {
                     entry.get("source"),
                     *entry.get("duplicate_sources", []),
                 }
-                if entry_sources & failed_sources:
+                if entry_sources & protected_sources:
                     continue
                 try:
                     client.delete(

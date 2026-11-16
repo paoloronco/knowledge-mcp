@@ -534,3 +534,55 @@ test('maintenance is surfaced in the health badges while polling stays responsiv
   assert.equal(elements['health'].children.some(x => /Backup or restore/.test(x.textContent)), false);
   assert.deepEqual(elements['health'].children.map(x => x.textContent.split(':')[0]), ['App', 'Qdrant', 'MCP', 'Documents', 'Host agent']);
 });
+
+test('readiness banner explains startup phases, progress and the next action', async () => {
+  const {elements, context, status} = dashboard({...legacy, onboarding_complete: true, setup_step: 7});
+  status.readiness = {
+    phase: 'starting', title: 'Starting up', detail: 'The vector database is warming up.',
+    ready: false, tone: 'busy', spinner: true,
+    steps: [{label: 'Database', state: 'active'}, {label: 'MCP server', state: 'pending'}],
+    action: {label: 'Start Qdrant', kind: 'start_qdrant'}
+  };
+  await vm.runInContext('refresh()', context);
+  assert.equal(elements['service-banner'].classList.contains('hidden'), false);
+  assert.equal(elements['service-banner'].classList.contains('service-banner-busy'), true);
+  assert.equal(elements['service-banner'].classList.contains('spinning'), true);
+  assert.match(elements['service-banner-title'].textContent, /Starting up/);
+  assert.match(elements['service-banner-detail'].textContent, /warming up/);
+  assert.match(elements['service-banner-steps'].textContent, /Database: in progress/);
+  assert.match(elements['service-banner-steps'].textContent, /MCP server: waiting/);
+  assert.equal(elements['service-banner-action'].textContent, 'Start Qdrant');
+  assert.equal(elements['service-banner-action'].classList.contains('hidden'), false);
+  status.readiness = {
+    phase: 'ready', title: 'Ready', detail: 'Your documents are searchable.',
+    ready: true, tone: 'ready', spinner: false,
+    steps: [{label: 'Database', state: 'done'}], action: null
+  };
+  await vm.runInContext('refresh()', context);
+  assert.equal(elements['service-banner'].classList.contains('service-banner-ready'), true);
+  assert.equal(elements['service-banner-action'].classList.contains('hidden'), true);
+});
+
+test('the readiness banner stays hidden when the backend does not report it', async () => {
+  const {elements, context} = dashboard({...legacy, onboarding_complete: true, setup_step: 7});
+  await vm.runInContext('refresh()', context);
+  assert.equal(elements['service-banner'].classList.contains('hidden'), true);
+});
+
+test('connection settings expose the MCP endpoint, version and update command', async () => {
+  const {elements, context, status} = dashboard({...legacy, onboarding_complete: true, setup_step: 7});
+  status.mcp_port = 8100;
+  status.version = '2.2.0';
+  await vm.runInContext('refresh()', context);
+  assert.equal(elements['mcp-endpoint'].value, 'http://HOST_IP:8100/mcp');
+  assert.equal(elements['app-version'].textContent, '2.2.0');
+  assert.match(elements['update-command'].value, /self-update\.sh/);
+});
+
+test('a global busy indicator reflects in-flight actions', async () => {
+  const {elements, context} = dashboard({...legacy, onboarding_complete: true, setup_step: 7});
+  await vm.runInContext('pendingActions = 2; renderBusy();', context);
+  assert.equal(elements['global-busy'].classList.contains('hidden'), false);
+  await vm.runInContext('pendingActions = 0; renderBusy();', context);
+  assert.equal(elements['global-busy'].classList.contains('hidden'), true);
+});
