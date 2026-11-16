@@ -1,17 +1,22 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PY_FILE="$SCRIPT_DIR/self_update.py"
+SCRIPT_SOURCE="${BASH_SOURCE[0]:-}"
+PY_FILE=""
+if [[ -n "$SCRIPT_SOURCE" && -f "$SCRIPT_SOURCE" ]]; then
+  PY_FILE="$(cd "$(dirname "$SCRIPT_SOURCE")" 2>/dev/null && pwd)/self_update.py"
+fi
 
-if [[ ! -f "$PY_FILE" ]]; then
-  PY_FILE="$(mktemp "${TMPDIR:-/tmp}/knowledge-self-update.XXXXXX.py")"
-  trap 'rm -f "$PY_FILE"' EXIT
+if [[ -z "$PY_FILE" || ! -f "$PY_FILE" ]]; then
+  TMP_DIR="$(mktemp -d "${TMPDIR:-/tmp}/knowledge-self-update.XXXXXX")"
+  trap 'rm -rf "$TMP_DIR"' EXIT
+  PY_FILE="$TMP_DIR/self_update.py"
   echo "[self-update] Fetching the updater from the repository…" >&2
+  URL="https://raw.githubusercontent.com/paoloronco/knowledge-mcp/main/scripts/self_update.py"
   if command -v curl >/dev/null 2>&1; then
-    curl -fsSL "https://raw.githubusercontent.com/paoloronco/knowledge-mcp/main/scripts/self_update.py" -o "$PY_FILE"
+    curl -fsSL "$URL" -o "$PY_FILE"
   elif command -v wget >/dev/null 2>&1; then
-    wget -qO "$PY_FILE" "https://raw.githubusercontent.com/paoloronco/knowledge-mcp/main/scripts/self_update.py"
+    wget -qO "$PY_FILE" "$URL"
   else
     echo "[self-update] curl or wget is required to fetch the updater." >&2
     exit 1

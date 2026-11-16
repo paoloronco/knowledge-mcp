@@ -30,6 +30,7 @@ jobs:
           python -m pip install -r knowledge-mcp/requirements.txt
           python -m py_compile scripts/self_update.py knowledge-mcp/mcp/app_version.py
           bash -n scripts/self-update.sh
+          bash scripts/self-update.sh --help >/dev/null
           python -m unittest discover -s tests -q
           node --test tests/test_dashboard.js
           docker compose config --quiet

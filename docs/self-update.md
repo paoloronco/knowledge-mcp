@@ -9,9 +9,10 @@ documents, the model cache, agent credentials and Qdrant indexes survive.
 
 ## One command (recommended)
 
-From a checkout of this repository:
+From a checkout of this repository, on the Docker host:
 
 ```bash
+git pull
 bash scripts/self-update.sh
 ```
 
@@ -24,6 +25,9 @@ Without a checkout, the wrapper fetches the updater itself:
 ```bash
 curl -fsSL https://raw.githubusercontent.com/paoloronco/knowledge-mcp/main/scripts/self-update.sh | bash
 ```
+
+Pass options to a piped command with `bash -s --`, for example
+`curl -fsSL …/self-update.sh | bash -s -- --dry-run`.
 
 Or run the Python updater directly with any Python 3:
 

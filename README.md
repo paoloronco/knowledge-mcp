@@ -180,9 +180,10 @@ If a document fails, fix its source or use **Ignore this file**, then retry the 
 
 ### One-command self-update (recommended)
 
-From a checkout of this repository, run on the Docker host:
+From a checkout of this repository, run on the Docker host (update the checkout first so the updater is present):
 
 ```bash
+git pull
 bash scripts/self-update.sh
 ```
 
